@@ -16,20 +16,25 @@ from collections import deque
 
 import numpy as np
 
-from sim.map_io import OccupancyGrid
+from sim.map_io import FREE, OccupancyGrid
 from sim.pathing import multi_target_shortest_paths, traversable_mask
 from sim.visibility import SensorModel, observable_wall_cells, scan_from_stop
 
 
 _ROBOT_RADIUS_M = 0.2
-_CANDIDATE_SPACING_M = 0.45
-_RIDGE_SPACING_M = 0.90
-_REFINEMENT_SPACING_M = 0.225
-_REFINEMENT_RADIUS_M = 1.0
 _MAX_REFINEMENT_CLUSTERS = 12
+_WALL_STANDOFFS_M = (0.75, 1.5, 2.5, 3.5, 4.5)
+_WALL_LATERAL_OFFSETS_M = (-0.3, 0.0, 0.3)
 _PLATEAU_WARMUP_STOPS = 5
 _PLATEAU_WINDOW_STOPS = 5
 _PLATEAU_GAIN_FRACTION = 0.1
+
+_LAST_CANDIDATE_DEBUG: dict[str, list[tuple[int, int]] | np.ndarray] = {}
+
+
+def get_last_candidate_debug() -> dict[str, list[tuple[int, int]] | np.ndarray]:
+    """Return copies of the most recently generated candidate categories."""
+    return {name: value.copy() for name, value in _LAST_CANDIDATE_DEBUG.items()}
 
 
 def _exterior_mask(valid_mask: np.ndarray) -> np.ndarray:
@@ -117,44 +122,15 @@ def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
     return labels == largest_component_id
 
 
-def _tile_candidates(grid: OccupancyGrid, valid_mask: np.ndarray) -> list[tuple[int, int]]:
-    """Pick one clearance-safe cell nearest the centre of each non-empty tile.
-
-    Choosing from each tile rather than requiring the lattice intersection
-    itself to be valid avoids silently skipping narrow corridors when the
-    lattice happens to land on a wall.
-    """
-    tile_size_px = max(1, int(round(_CANDIDATE_SPACING_M / grid.resolution)))
-    candidates: list[tuple[int, int]] = []
-
-    for row_start in range(0, grid.height, tile_size_px):
-        row_end = min(row_start + tile_size_px, grid.height)
-        for col_start in range(0, grid.width, tile_size_px):
-            col_end = min(col_start + tile_size_px, grid.width)
-            valid_in_tile = np.argwhere(valid_mask[row_start:row_end, col_start:col_end])
-            if valid_in_tile.size == 0:
-                continue
-
-            center_row = (row_start + row_end - 1) / 2
-            center_col = (col_start + col_end - 1) / 2
-            rows = valid_in_tile[:, 0] + row_start
-            cols = valid_in_tile[:, 1] + col_start
-            squared_distance = (rows - center_row) ** 2 + (cols - center_col) ** 2
-            # np.argmin keeps the first tied element. argwhere is row-major,
-            # yielding a stable (row, col) tie break.
-            best = int(np.argmin(squared_distance))
-            candidates.append((int(rows[best]), int(cols[best])))
-
-    return candidates
-
-
-def _distance_ridge_candidates(grid: OccupancyGrid, valid_mask: np.ndarray) -> list[tuple[int, int]]:
+def _distance_ridge_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
+                               coverage_range_m: float) -> list[tuple[int, int]]:
     """Sample high-clearance room centres and corridor centre lines.
 
     A multi-source grid distance transform is sufficient here: the local
     distance ridges approximate a medial-axis skeleton without introducing a
-    new dependency. One ridge cell per 90 cm tile avoids oversampling a long
-    corridor centre line.
+    new dependency. Long ridge components are sampled only when their extent
+    exceeds the sensor's useful coverage range, rather than on an arbitrary
+    map-grid spacing.
     """
     height, width = valid_mask.shape
     distance = np.full(valid_mask.shape, -1, dtype=np.int32)
@@ -196,24 +172,51 @@ def _distance_ridge_candidates(grid: OccupancyGrid, valid_mask: np.ndarray) -> l
             if row_offset != 0 or col_offset != 0
         )
 
-    tile_size_px = max(1, int(round(_RIDGE_SPACING_M / grid.resolution)))
     candidates: list[tuple[int, int]] = []
-    for row_start in range(0, height, tile_size_px):
-        row_end = min(row_start + tile_size_px, height)
-        for col_start in range(0, width, tile_size_px):
-            col_end = min(col_start + tile_size_px, width)
-            points = np.argwhere(ridge[row_start:row_end, col_start:col_end])
-            if points.size == 0:
-                continue
-            rows = points[:, 0] + row_start
-            cols = points[:, 1] + col_start
-            best = int(np.argmax(distance[rows, cols]))
-            candidates.append((int(rows[best]), int(cols[best])))
+    visited = np.zeros_like(ridge, dtype=bool)
+    coverage_range_px = coverage_range_m / grid.resolution
+    for row, col in np.argwhere(ridge):
+        row, col = int(row), int(col)
+        if visited[row, col]:
+            continue
+        component: list[tuple[int, int]] = []
+        frontier: deque[tuple[int, int]] = deque([(row, col)])
+        visited[row, col] = True
+        while frontier:
+            current_row, current_col = frontier.popleft()
+            component.append((current_row, current_col))
+            for row_offset in (-1, 0, 1):
+                for col_offset in (-1, 0, 1):
+                    if row_offset == 0 and col_offset == 0:
+                        continue
+                    neighbor_row, neighbor_col = current_row + row_offset, current_col + col_offset
+                    if (0 <= neighbor_row < height and 0 <= neighbor_col < width
+                            and ridge[neighbor_row, neighbor_col] and not visited[neighbor_row, neighbor_col]):
+                        visited[neighbor_row, neighbor_col] = True
+                        frontier.append((neighbor_row, neighbor_col))
+
+        selected = [max(component, key=lambda point: (distance[point], -point[0], -point[1]))]
+        while True:
+            candidate = max(
+                component,
+                key=lambda point: (
+                    min((point[0] - chosen[0]) ** 2 + (point[1] - chosen[1]) ** 2 for chosen in selected),
+                    distance[point], -point[0], -point[1],
+                ),
+            )
+            nearest_distance_px = min(
+                np.hypot(candidate[0] - chosen[0], candidate[1] - chosen[1])
+                for chosen in selected
+            )
+            if nearest_distance_px <= coverage_range_px:
+                break
+            selected.append(candidate)
+        candidates.extend(selected)
     return candidates
 
 
 def _cluster_representatives(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return centroid-like representatives of the largest 8-connected gaps."""
+    """Return wall-cell representatives of the largest 8-connected gaps."""
     height, width = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
     clusters: list[tuple[int, int, int, int]] = []  # size, first row, first col, packed centroid
@@ -225,8 +228,10 @@ def _cluster_representatives(mask: np.ndarray) -> list[tuple[int, int]]:
         visited[row, col] = True
         size = row_sum = col_sum = 0
         first_row, first_col = row, col
+        points: list[tuple[int, int]] = []
         while frontier:
             current_row, current_col = frontier.popleft()
+            points.append((current_row, current_col))
             size += 1
             row_sum += current_row
             col_sum += current_col
@@ -239,28 +244,52 @@ def _cluster_representatives(mask: np.ndarray) -> list[tuple[int, int]]:
                             and mask[neighbor_row, neighbor_col] and not visited[neighbor_row, neighbor_col]):
                         visited[neighbor_row, neighbor_col] = True
                         frontier.append((neighbor_row, neighbor_col))
-        centroid = (int(round(row_sum / size)), int(round(col_sum / size)))
-        clusters.append((size, first_row, first_col, centroid[0] * width + centroid[1]))
+        centroid_row = row_sum / size
+        centroid_col = col_sum / size
+        representative_row, representative_col = min(
+            points,
+            key=lambda point: ((point[0] - centroid_row) ** 2 + (point[1] - centroid_col) ** 2, point),
+        )
+        clusters.append((size, first_row, first_col, representative_row * width + representative_col))
 
     clusters.sort(key=lambda cluster: (-cluster[0], cluster[1], cluster[2]))
     return [(packed // width, packed % width) for _, _, _, packed in clusters[:_MAX_REFINEMENT_CLUSTERS]]
 
 
+def _wall_face_directions(grid: OccupancyGrid, row: int, col: int) -> list[tuple[int, int]]:
+    """Return directions from a wall cell toward its adjacent free-space faces."""
+    directions: list[tuple[int, int]] = []
+    for row_offset in (-1, 0, 1):
+        for col_offset in (-1, 0, 1):
+            if row_offset == 0 and col_offset == 0:
+                continue
+            neighbor_row, neighbor_col = row + row_offset, col + col_offset
+            if grid.in_bounds(neighbor_row, neighbor_col) and grid.data[neighbor_row, neighbor_col] == FREE:
+                directions.append((row_offset, col_offset))
+    return directions
+
+
 def _refinement_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
                            gap_mask: np.ndarray, existing: set[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Add fine local candidates around the largest currently uncovered gaps."""
-    spacing_px = max(1, int(round(_REFINEMENT_SPACING_M / grid.resolution)))
-    radius_px = max(spacing_px, int(round(_REFINEMENT_RADIUS_M / grid.resolution)))
+    """Generate head-on candidate views for the largest uncovered wall gaps."""
     candidates: list[tuple[int, int]] = []
-    for center_row, center_col in _cluster_representatives(gap_mask):
-        for row in range(center_row - radius_px, center_row + radius_px + 1, spacing_px):
-            for col in range(center_col - radius_px, center_col + radius_px + 1, spacing_px):
-                if not (0 <= row < grid.height and 0 <= col < grid.width) or not valid_mask[row, col]:
-                    continue
-                point = (row, col)
-                if point not in existing:
-                    existing.add(point)
-                    candidates.append(point)
+    for wall_row, wall_col in _cluster_representatives(gap_mask):
+        for normal_row, normal_col in _wall_face_directions(grid, wall_row, wall_col):
+            normal_length = np.hypot(normal_row, normal_col)
+            unit_row, unit_col = normal_row / normal_length, normal_col / normal_length
+            lateral_row, lateral_col = -unit_col, unit_row
+            for standoff_m in _WALL_STANDOFFS_M:
+                standoff_px = standoff_m / grid.resolution
+                for lateral_offset_m in _WALL_LATERAL_OFFSETS_M:
+                    lateral_px = lateral_offset_m / grid.resolution
+                    row = int(round(wall_row + unit_row * standoff_px + lateral_row * lateral_px))
+                    col = int(round(wall_col + unit_col * standoff_px + lateral_col * lateral_px))
+                    if not (0 <= row < grid.height and 0 <= col < grid.width) or not valid_mask[row, col]:
+                        continue
+                    point = (row, col)
+                    if point not in existing:
+                        existing.add(point)
+                        candidates.append(point)
     return candidates
 
 
@@ -403,21 +432,21 @@ def _greedy_selection(candidate_coverage: list[set[tuple[int, int]],], total_tar
 def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[float, float]]:
     """Plan stops from floor-plan topology and visibility-driven refinement."""
     clearance_safe_mask = traversable_mask(grid, _ROBOT_RADIUS_M)
-    enclosed_mask = clearance_safe_mask & ~_exterior_mask(clearance_safe_mask)
+    exterior_mask = _exterior_mask(clearance_safe_mask)
+    enclosed_mask = clearance_safe_mask & ~exterior_mask
     valid_mask = _largest_connected_component(enclosed_mask)
     observable = observable_wall_cells(grid)
 
-    # Coarse tiling provides broad room coverage; distance ridges add points
-    # along corridor centre lines, room centres, and junction-like regions.
-    candidate_pixels = _tile_candidates(grid, valid_mask)
+    # A range-spaced medial ridge supplies room centres, corridor centre lines,
+    # and junction-like viewpoints without uniform map-grid sampling.
+    effective_range_m = sensor.max_range_m * np.sqrt(1.0 - sensor.min_quality)
+    topology_pixels = _distance_ridge_candidates(grid, valid_mask, effective_range_m)
+    candidate_pixels = topology_pixels.copy()
     existing_pixels = set(candidate_pixels)
-    ridge_pixels = _distance_ridge_candidates(grid, valid_mask)
-    candidate_pixels.extend(point for point in ridge_pixels if point not in existing_pixels)
-    existing_pixels.update(ridge_pixels)
     print(
         f"[planner] largest enclosed component has {int(valid_mask.sum())} cells; "
-        f"{len(candidate_pixels)} initial candidates "
-        f"({len(ridge_pixels)} distance-ridge candidates) for "
+        f"{len(candidate_pixels)} range-spaced topology candidates "
+        f"(effective range {effective_range_m:.2f} m) for "
         f"{int(observable.sum())} observable wall cells",
         flush=True,
     )
@@ -435,13 +464,24 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
         gap_mask[row, col] = True
     refinement_pixels = _refinement_candidates(grid, valid_mask, gap_mask, existing_pixels)
     if refinement_pixels:
-        print(f"[planner] adding {len(refinement_pixels)} local candidates around coverage gaps", flush=True)
+        print(f"[planner] adding {len(refinement_pixels)} wall-normal candidates for coverage gaps", flush=True)
         refinement_stops, refinement_coverage = _scan_candidates(
             grid, sensor, refinement_pixels, observable, "refinement candidates",
         )
         candidate_pixels.extend(refinement_pixels)
         candidate_stops.extend(refinement_stops)
         candidate_coverage.extend(refinement_coverage)
+
+    global _LAST_CANDIDATE_DEBUG
+    _LAST_CANDIDATE_DEBUG = {
+        "topology": topology_pixels,
+        "refinement": refinement_pixels,
+        "all": candidate_pixels.copy(),
+        "clearance_safe": clearance_safe_mask.copy(),
+        "exterior": exterior_mask.copy(),
+        "enclosed": enclosed_mask.copy(),
+        "operating": valid_mask.copy(),
+    }
 
     selection_order, covered = _greedy_selection(candidate_coverage, int(observable.sum()))
 
