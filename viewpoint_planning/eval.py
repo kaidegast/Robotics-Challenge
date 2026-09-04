@@ -43,6 +43,7 @@ def main() -> None:
     sensor = SensorModel(max_range_m=MAX_RANGE_M, min_quality=MIN_QUALITY)
 
     module = importlib.import_module(args.solution)
+    print("[eval] planning viewpoints", flush=True)
     t0 = time.perf_counter()
     stops = module.plan_viewpoints(grid, sensor)
     elapsed = time.perf_counter() - t0
@@ -51,7 +52,10 @@ def main() -> None:
         print("plan_viewpoints() returned no stops.")
         sys.exit(1)
 
-    report = score_solution(grid, stops, sensor, robot_radius_m=ROBOT_RADIUS_M)
+    print("[eval] scoring coverage and tour", flush=True)
+    report = score_solution(
+        grid, stops, sensor, robot_radius_m=ROBOT_RADIUS_M, progress=True,
+    )
 
     print(f"Map:              {args.map}")
     print(f"Planning time:    {elapsed:.2f}s")
