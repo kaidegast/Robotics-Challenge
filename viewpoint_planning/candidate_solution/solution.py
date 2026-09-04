@@ -215,6 +215,132 @@ def _distance_ridge_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
     return candidates
 
 
+def _thin_topology(binary: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning for a small, topology-scale free-space raster."""
+    image = binary.astype(np.uint8).copy()
+    while True:
+        changed = False
+        for phase in (0, 1):
+            padded = np.pad(image, 1, mode="constant", constant_values=0)
+            neighbors = [
+                padded[:-2, 1:-1], padded[:-2, 2:], padded[1:-1, 2:], padded[2:, 2:],
+                padded[2:, 1:-1], padded[2:, :-2], padded[1:-1, :-2], padded[:-2, :-2],
+            ]
+            neighbor_count = sum(neighbors)
+            transitions = sum(
+                (neighbors[index] == 0) & (neighbors[(index + 1) % 8] == 1)
+                for index in range(8)
+            )
+            if phase == 0:
+                preserve = (neighbors[0] * neighbors[2] * neighbors[4] == 0) & (
+                    neighbors[2] * neighbors[4] * neighbors[6] == 0
+                )
+            else:
+                preserve = (neighbors[0] * neighbors[2] * neighbors[6] == 0) & (
+                    neighbors[0] * neighbors[4] * neighbors[6] == 0
+                )
+            remove = (image == 1) & (neighbor_count >= 2) & (neighbor_count <= 6) & (transitions == 1) & preserve
+            if remove.any():
+                image[remove] = 0
+                changed = True
+        if not changed:
+            return image.astype(bool)
+
+
+def _topology_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
+                         coverage_range_m: float) -> list[tuple[int, int]]:
+    """Generate room/corridor features from a simplified skeleton graph."""
+    # Use a topology map at one quarter of the robot radius (5 cm for the
+    # challenge robot), removing pixel-scale wall noise before skeletonization.
+    factor = max(1, int(round((_ROBOT_RADIUS_M / 4) / grid.resolution)))
+    padded_height = int(np.ceil(grid.height / factor)) * factor
+    padded_width = int(np.ceil(grid.width / factor)) * factor
+    padded = np.pad(valid_mask, ((0, padded_height - grid.height), (0, padded_width - grid.width)))
+    topology_free = padded.reshape(padded_height // factor, factor, padded_width // factor, factor).any(axis=(1, 3))
+    skeleton = _thin_topology(topology_free)
+    height, width = skeleton.shape
+
+    padded_skeleton = np.pad(skeleton, 1, mode="constant", constant_values=False)
+    degree = np.zeros_like(skeleton, dtype=np.int8)
+    for row_offset in (-1, 0, 1):
+        for col_offset in (-1, 0, 1):
+            if row_offset != 0 or col_offset != 0:
+                degree += padded_skeleton[
+                    1 + row_offset:1 + row_offset + height,
+                    1 + col_offset:1 + col_offset + width,
+                ]
+    node_mask = skeleton & (degree != 2)
+    node_points = {tuple(map(int, point)) for point in np.argwhere(node_mask)}
+    if not node_points and skeleton.any():
+        node_points.add(tuple(map(int, np.argwhere(skeleton)[0])))
+
+    def neighbors(point: tuple[int, int]) -> list[tuple[int, int]]:
+        row, col = point
+        return [
+            (row + row_offset, col + col_offset)
+            for row_offset in (-1, 0, 1)
+            for col_offset in (-1, 0, 1)
+            if (row_offset != 0 or col_offset != 0)
+            and 0 <= row + row_offset < height and 0 <= col + col_offset < width
+            and skeleton[row + row_offset, col + col_offset]
+        ]
+
+    def edge_key(first: tuple[int, int], second: tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int]]:
+        return (first, second) if first <= second else (second, first)
+
+    feature_points = set(node_points)
+    visited_edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    topology_resolution = factor * grid.resolution
+    for start in sorted(node_points):
+        for first_neighbor in neighbors(start):
+            if edge_key(start, first_neighbor) in visited_edges:
+                continue
+            path = [start]
+            previous, current = start, first_neighbor
+            while True:
+                visited_edges.add(edge_key(previous, current))
+                path.append(current)
+                if current in node_points:
+                    break
+                next_points = [point for point in neighbors(current) if point != previous]
+                if not next_points:
+                    break
+                previous, current = current, next_points[0]
+
+            segment_length = sum(
+                np.hypot(path[index + 1][0] - path[index][0], path[index + 1][1] - path[index][1])
+                for index in range(len(path) - 1)
+            ) * topology_resolution
+            segment_count = int(np.ceil(segment_length / coverage_range_m))
+            for index in range(1, segment_count):
+                target_length = segment_length * index / segment_count
+                accumulated = 0.0
+                for path_index in range(len(path) - 1):
+                    step_length = np.hypot(
+                        path[path_index + 1][0] - path[path_index][0],
+                        path[path_index + 1][1] - path[path_index][1],
+                    ) * topology_resolution
+                    accumulated += step_length
+                    if accumulated >= target_length:
+                        feature_points.add(path[path_index + 1])
+                        break
+
+    candidates: list[tuple[int, int]] = []
+    for topology_row, topology_col in sorted(feature_points):
+        row_start, col_start = topology_row * factor, topology_col * factor
+        row_end = min(row_start + factor, grid.height)
+        col_end = min(col_start + factor, grid.width)
+        valid_points = np.argwhere(valid_mask[row_start:row_end, col_start:col_end])
+        if valid_points.size == 0:
+            continue
+        center_row = (row_start + row_end - 1) / 2
+        center_col = (col_start + col_end - 1) / 2
+        rows, cols = valid_points[:, 0] + row_start, valid_points[:, 1] + col_start
+        best = int(np.argmin((rows - center_row) ** 2 + (cols - center_col) ** 2))
+        candidates.append((int(rows[best]), int(cols[best])))
+    return candidates
+
+
 def _cluster_representatives(mask: np.ndarray) -> list[tuple[int, int]]:
     """Return wall-cell representatives of the largest 8-connected gaps."""
     height, width = mask.shape
@@ -437,15 +563,15 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     valid_mask = _largest_connected_component(enclosed_mask)
     observable = observable_wall_cells(grid)
 
-    # A range-spaced medial ridge supplies room centres, corridor centre lines,
-    # and junction-like viewpoints without uniform map-grid sampling.
+    # Skeleton graph features supply room centres, corridor junctions and
+    # sensor-range samples on long corridors without uniform map sampling.
     effective_range_m = sensor.max_range_m * np.sqrt(1.0 - sensor.min_quality)
-    topology_pixels = _distance_ridge_candidates(grid, valid_mask, effective_range_m)
+    topology_pixels = _topology_candidates(grid, valid_mask, effective_range_m)
     candidate_pixels = topology_pixels.copy()
     existing_pixels = set(candidate_pixels)
     print(
         f"[planner] largest enclosed component has {int(valid_mask.sum())} cells; "
-        f"{len(candidate_pixels)} range-spaced topology candidates "
+        f"{len(candidate_pixels)} skeleton-topology candidates "
         f"(effective range {effective_range_m:.2f} m) for "
         f"{int(observable.sum())} observable wall cells",
         flush=True,
