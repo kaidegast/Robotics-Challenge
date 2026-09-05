@@ -57,17 +57,25 @@ class ScoreReport:
 
 
 def score_solution(grid: OccupancyGrid, stops: list[tuple[float, float]],
-                    sensor: SensorModel, robot_radius_m: float = 0.2) -> ScoreReport:
+                    sensor: SensorModel, robot_radius_m: float = 0.2,
+                    progress: bool = False) -> ScoreReport:
+    def log(message: str) -> None:
+        if progress:
+            print(f"[scorer] {message}", flush=True)
+
     invalid = [s for s in stops if not is_stop_valid(grid, s, robot_radius_m)]
 
     covered: dict[tuple[int, int], float] = {}
-    for stop in stops:
+    score_progress_interval = max(1, len(stops) // 10)
+    for index, stop in enumerate(stops, start=1):
         if stop in invalid:
             continue  # an invalid stop doesn't get to contribute a scan
         seen = scan_from_stop(grid, stop, sensor)
         for cell, quality in seen.items():
             if quality > covered.get(cell, 0.0):
                 covered[cell] = quality
+        if progress and (index == 1 or index == len(stops) or index % score_progress_interval == 0):
+            log(f"scoring scans: {index}/{len(stops)}")
 
     total_occupied_cells = int((grid.data == 1).sum())
     total_wall_cells = int(observable_wall_cells(grid).sum())
@@ -78,10 +86,14 @@ def score_solution(grid: OccupancyGrid, stops: list[tuple[float, float]],
     traversable = traversable_mask(grid, robot_radius_m)
     tour_length = 0.0
     path_segments: list[list[tuple[int, int]] | None] = []
-    for i in range(len(stops) - 1):
+    path_count = len(stops) - 1
+    path_progress_interval = max(1, path_count // 10)
+    for i in range(path_count):
         length_m, path = shortest_path(grid, stops[i], stops[i + 1], traversable)
         tour_length += length_m
         path_segments.append(path)
+        if progress and (i == 0 or i + 1 == path_count or (i + 1) % path_progress_interval == 0):
+            log(f"routing tour segments: {i + 1}/{path_count}")
 
     return ScoreReport(
         coverage_fraction=coverage_fraction,

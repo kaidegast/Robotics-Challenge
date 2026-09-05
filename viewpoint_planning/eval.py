@@ -27,6 +27,85 @@ MIN_QUALITY = 0.5
 ROBOT_RADIUS_M = 0.2
 
 
+def render_candidate_debug(grid, candidates: dict[str, object], out_path: Path) -> None:
+    """Render the complete candidate pool exposed by a solution module."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    rgb = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
+    rgb[grid.data == 0] = (255, 255, 255)
+    rgb[grid.data == 1] = (45, 45, 45)
+    rgb[grid.data == 2] = (205, 205, 205)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(rgb)
+
+    styles = (
+        ("topology", "#1f77b4", "skeleton topology"),
+        ("refinement", "#d62728", "wall-normal refinement"),
+    )
+    for category, color, label in styles:
+        pixels = candidates.get(category, [])
+        if isinstance(pixels, list) and pixels:
+            ax.scatter([col for _, col in pixels], [row for row, _ in pixels],
+                       s=9, c=color, label=f"{label} ({len(pixels)})", alpha=0.75)
+    all_candidates = candidates.get("all", [])
+    total = len(all_candidates) if isinstance(all_candidates, list) else 0
+    ax.set_title(f"Candidate viewpoints: {total} total")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def render_area_debug(grid, debug: dict[str, object], out_path: Path) -> None:
+    """Render the operating-area classification used by the candidate planner."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Patch
+
+    def mask(name: str) -> np.ndarray:
+        value = debug.get(name)
+        if not isinstance(value, np.ndarray):
+            raise ValueError(f"Candidate debug data has no {name!r} mask")
+        return value
+
+    clearance_safe = mask("clearance_safe")
+    exterior = mask("exterior")
+    enclosed = mask("enclosed")
+    operating = mask("operating")
+    rgb = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
+    rgb[grid.data == 0] = (232, 232, 232)  # free, but no footprint clearance
+    rgb[grid.data == 1] = (45, 45, 45)
+    rgb[grid.data == 2] = (160, 160, 160)
+    rgb[clearance_safe] = (195, 195, 195)
+    rgb[exterior] = (247, 196, 75)
+    rgb[enclosed & ~operating] = (230, 126, 34)
+    rgb[operating] = (46, 204, 113)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(rgb)
+    points = debug.get("all", [])
+    if isinstance(points, list) and points:
+        ax.scatter([col for _, col in points], [row for row, _ in points],
+                   s=7, c="black", alpha=0.7, label=f"candidates ({len(points)})")
+    legend = [
+        Patch(color="#2ecc71", label="operating region / candidate area"),
+        Patch(color="#e67e22", label="enclosed but disconnected"),
+        Patch(color="#f7c44b", label="boundary-connected exterior"),
+        Patch(color="#c3c3c3", label="clearance-safe, unclassified"),
+        Patch(color="#e8e8e8", label="free but too close to wall"),
+        Patch(color="#2d2d2d", label="wall"),
+        Patch(color="#a0a0a0", label="unknown"),
+    ]
+    ax.legend(handles=legend, loc="upper right", fontsize=7)
+    ax.set_title("Robot operating-area classification")
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--map", required=True, help="Path to a room.yaml")
@@ -35,8 +114,12 @@ def main() -> None:
     parser.add_argument("--results-dir", default="results",
                          help="Parent directory for timestamped session output")
     parser.add_argument("--out", default=None,
-                         help="Explicit PNG output path, overriding the timestamped results dir")
+                        help="Explicit PNG output path, overriding the timestamped results dir")
     parser.add_argument("--no-viz", action="store_true")
+    parser.add_argument("--debug-candidates", action="store_true",
+                        help="Save a candidate_positions.png debug image alongside the report")
+    parser.add_argument("--debug-areas", action="store_true",
+                        help="Save an area_classification.png planner-mask debug image")
     args = parser.parse_args()
 
     grid = load_occupancy_grid(args.map)
@@ -73,6 +156,21 @@ def main() -> None:
     json_path.write_text(json.dumps(
         {"map": args.map, "planning_time_s": elapsed, **report.to_dict()}, indent=2))
     print(f"Report JSON:      {json_path}")
+
+    if args.debug_candidates or args.debug_areas:
+        debug_getter = getattr(module, "get_last_candidate_debug", None)
+        if debug_getter is None:
+            print("Debug images unavailable: solution does not expose candidate data.")
+        else:
+            debug_data = debug_getter()
+            if args.debug_candidates:
+                debug_path = png_path.with_name("candidate_positions.png")
+                render_candidate_debug(grid, debug_data, debug_path)
+                print(f"Candidate debug:  {debug_path}")
+            if args.debug_areas:
+                area_path = png_path.with_name("area_classification.png")
+                render_area_debug(grid, debug_data, area_path)
+                print(f"Area debug:       {area_path}")
 
     if not args.no_viz:
         render_report(grid, stops, report, str(png_path))

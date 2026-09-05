@@ -25,10 +25,6 @@ _ROBOT_RADIUS_M = 0.2
 _MAX_REFINEMENT_CLUSTERS = 12
 _WALL_STANDOFFS_M = (0.75, 1.5, 2.5, 3.5, 4.5)
 _WALL_LATERAL_OFFSETS_M = (-0.3, 0.0, 0.3)
-_PLATEAU_WARMUP_STOPS = 5
-_PLATEAU_WINDOW_STOPS = 5
-_PLATEAU_GAIN_FRACTION = 0.1
-
 _LAST_CANDIDATE_DEBUG: dict[str, list[tuple[int, int]] | np.ndarray] = {}
 
 
@@ -507,18 +503,40 @@ def _scan_candidates(grid: OccupancyGrid, sensor: SensorModel,
     return stops, coverage
 
 
-def _greedy_selection(candidate_coverage: list[set[tuple[int, int]],], total_targets: int) -> tuple[list[int], set[tuple[int, int]]]:
-    """Run greedy set cover until the marginal-coverage plateau."""
+def _attainable_targets(candidate_coverage: list[set[tuple[int, int]]]) -> set[tuple[int, int]]:
+    """Return wall cells visible from at least one generated valid candidate.
+
+    This is the coverage target for the candidate-set formulation.  Cells
+    outside this union may be observable in the raster scorer, but cannot be
+    reached by the particular robot-safe candidate pool, so treating them as
+    a greedy stopping criterion would add no useful stops.
+    """
+    return set().union(*candidate_coverage) if candidate_coverage else set()
+
+
+def _greedy_selection(
+    candidate_coverage: list[set[tuple[int, int]]],
+    attainable_targets: set[tuple[int, int]],
+    total_targets: int,
+) -> tuple[list[int], set[tuple[int, int]], int]:
+    """Build a greedy coverage curve and retain its deterministic knee.
+
+    The curve has normalized selected-stop count on x and normalized
+    attainable coverage on y.  The knee is the point furthest above the
+    straight line from (0, 0) to complete attainable coverage (``y - x``).
+    It captures the transition from high-return stops to the long tail of
+    small marginal gains without a hand-tuned coverage percentage.
+    """
     covered: set[tuple[int, int]] = set()
     selected_indices: set[int] = set()
     selection_order: list[int] = []
-    marginal_gains: list[int] = []
     covering_candidates: dict[tuple[int, int], list[int]] = {}
     for candidate_index, coverage in enumerate(candidate_coverage):
         for target in coverage:
             covering_candidates.setdefault(target, []).append(candidate_index)
     marginal_gain = [len(coverage) for coverage in candidate_coverage]
-    print("[planner] selecting stops greedily", flush=True)
+    cumulative_coverage: list[int] = []
+    print("[planner] building greedy attainable-coverage curve", flush=True)
 
     while True:
         best_index: int | None = None
@@ -531,28 +549,43 @@ def _greedy_selection(candidate_coverage: list[set[tuple[int, int]],], total_tar
 
         selected_indices.add(best_index)
         selection_order.append(best_index)
-        marginal_gains.append(best_gain)
         newly_covered = candidate_coverage[best_index] - covered
         covered.update(newly_covered)
+        cumulative_coverage.append(len(covered))
         for target in newly_covered:
             for candidate_index in covering_candidates[target]:
                 if candidate_index not in selected_indices:
                     marginal_gain[candidate_index] -= 1
         if len(selection_order) == 1 or len(selection_order) % 50 == 0:
-            print(f"[planner] selected {len(selection_order)} stops; covered {len(covered)}/{total_targets} wall cells", flush=True)
+            print(
+                f"[planner] selected {len(selection_order)} stops; covered "
+                f"{len(covered)}/{len(attainable_targets)} attainable "
+                f"({len(covered)}/{total_targets} scored) wall cells",
+                flush=True,
+            )
 
-        if len(marginal_gains) >= _PLATEAU_WARMUP_STOPS + _PLATEAU_WINDOW_STOPS:
-            reference = sum(marginal_gains[:_PLATEAU_WARMUP_STOPS]) / _PLATEAU_WARMUP_STOPS
-            recent = sum(marginal_gains[-_PLATEAU_WINDOW_STOPS:]) / _PLATEAU_WINDOW_STOPS
-            if recent < _PLATEAU_GAIN_FRACTION * reference:
-                print(
-                    f"[planner] coverage plateau after {len(selection_order)} stops: "
-                    f"recent gain {recent:.1f} cells/stop is below "
-                    f"{_PLATEAU_GAIN_FRACTION:.0%} of initial gain {reference:.1f}",
-                    flush=True,
-                )
-                break
-    return selection_order, covered
+    if not selection_order or not attainable_targets:
+        return [], set(), 0
+
+    stop_count = len(selection_order)
+    attainable_count = len(attainable_targets)
+    knee_index = max(
+        range(stop_count),
+        key=lambda index: (
+            cumulative_coverage[index] / attainable_count - (index + 1) / stop_count,
+            -index,
+        ),
+    )
+    required_coverage = cumulative_coverage[knee_index]
+    selection_order = selection_order[:knee_index + 1]
+    covered = set().union(*(candidate_coverage[index] for index in selection_order))
+    print(
+        f"[planner] coverage-curve knee at stop {knee_index + 1}/{stop_count}: "
+        f"{required_coverage}/{attainable_count} attainable wall cells "
+        f"({required_coverage / attainable_count:.1%})",
+        flush=True,
+    )
+    return selection_order, covered, required_coverage
 
 
 def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[float, float]]:
@@ -580,14 +613,13 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     candidate_stops, candidate_coverage = _scan_candidates(
         grid, sensor, candidate_pixels, observable, "initial candidates",
     )
-    _, initial_covered = _greedy_selection(candidate_coverage, int(observable.sum()))
 
-    # Only refine targets already known to be observable from the operating
-    # region. This avoids spending work on exterior or sealed-room wall faces.
-    initially_attainable = set().union(*candidate_coverage) if candidate_coverage else set()
-    gap_mask = np.zeros_like(observable, dtype=bool)
-    for row, col in initially_attainable - initial_covered:
-        gap_mask[row, col] = True
+    # Enrich the pool where topology positions see nothing.  A later union of
+    # both scan sets defines the actual attainable target for stop selection.
+    initially_attainable = _attainable_targets(candidate_coverage)
+    gap_mask = observable.copy()
+    for row, col in initially_attainable:
+        gap_mask[row, col] = False
     refinement_pixels = _refinement_candidates(grid, valid_mask, gap_mask, existing_pixels)
     if refinement_pixels:
         print(f"[planner] adding {len(refinement_pixels)} wall-normal candidates for coverage gaps", flush=True)
@@ -609,11 +641,15 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
         "operating": valid_mask.copy(),
     }
 
-    selection_order, covered = _greedy_selection(candidate_coverage, int(observable.sum()))
+    attainable_targets = _attainable_targets(candidate_coverage)
+    selection_order, covered, required_coverage = _greedy_selection(
+        candidate_coverage, attainable_targets, int(observable.sum()),
+    )
 
     # A later greedy choice can make an earlier stop redundant.  Reverse
-    # deletion keeps the same union of wall cells while removing every stop
-    # whose complete contribution is duplicated by the remaining plan.
+    # deletion removes any stop whose removal keeps the knee coverage target
+    # met; it may therefore drop low-return tail stops as well as duplicated
+    # stops.
     target_counts: dict[tuple[int, int], int] = {}
     for candidate_index in selection_order:
         for target in candidate_coverage[candidate_index]:
@@ -621,10 +657,15 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
 
     retained_indices = set(selection_order)
     for candidate_index in reversed(selection_order):
-        if all(target_counts[target] > 1 for target in candidate_coverage[candidate_index]):
+        uniquely_covered = [
+            target for target in candidate_coverage[candidate_index]
+            if target_counts[target] == 1
+        ]
+        if len(covered) - len(uniquely_covered) >= required_coverage:
             retained_indices.remove(candidate_index)
             for target in candidate_coverage[candidate_index]:
                 target_counts[target] -= 1
+            covered.difference_update(uniquely_covered)
 
     removed_count = len(selection_order) - len(retained_indices)
     selected = [
@@ -635,7 +676,9 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     print(
         f"[planner] pruned {removed_count} redundant stops; "
         f"finished with {len(selected)} stops; "
-        f"covered {len(covered)}/{int(observable.sum())} wall cells",
+        f"covered {len(covered)}/{len(attainable_targets)} attainable wall cells "
+        f"({len(covered) / len(attainable_targets) if attainable_targets else 0.0:.1%}); "
+        f"{len(covered)}/{int(observable.sum())} scorer wall cells",
         flush=True,
     )
 
