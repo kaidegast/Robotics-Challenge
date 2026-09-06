@@ -119,6 +119,8 @@ def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
                 largest_component_id = component_id
                 largest_component_size = component_size
 
+    if largest_component_size == 0:
+        return np.zeros_like(mask, dtype=bool)
     return labels == largest_component_id
 
 
