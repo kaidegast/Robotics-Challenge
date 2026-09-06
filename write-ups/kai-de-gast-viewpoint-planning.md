@@ -204,10 +204,11 @@ from the robot's selected indoor operating area.
   planning time fell from the exact-routing run of 221.5 s to 26.0 s.
 
 <p align="center">
-  <img src="../viewpoint_planning/results/20260905_220856/area_classification.png" alt="Map 4 area classification" width="33%" />
-  <img src="../viewpoint_planning/results/20260905_220856/candidate_positions.png" alt="Map 4 candidate viewpoints" width="33%" />
-  <img src="../viewpoint_planning/results/20260905_220856/coverage_report.png" alt="Map 4 viewpoint-planning result" width="33%" />
+  <img src="../results/viewpoint_planning/4/area_classification.png" alt="Map 4 area classification" width="33%" />
+  <img src="../results/viewpoint_planning/4/candidate_positions.png" alt="Map 4 candidate viewpoints" width="33%" />
+  <img src="../results/viewpoint_planning/4/coverage_report.png" alt="Map 4 viewpoint-planning result" width="33%" />
 </p>
+
 <p align="center">
   <em>Map 4 debug run. Left: area classification. Centre: candidate positions. Right: final viewpoint-planning result.</em>
 </p>
