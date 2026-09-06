@@ -12,16 +12,801 @@ See README.md for the full brief, scoring rubric, and how to run
 """
 from __future__ import annotations
 
-from sim.map_io import OccupancyGrid
-from sim.visibility import SensorModel
+from collections import deque
+import heapq
+
+import numpy as np
+
+from sim.map_io import FREE, OccupancyGrid
+from sim.pathing import multi_target_shortest_paths, traversable_mask
+from sim.visibility import SensorModel, observable_wall_cells, scan_from_stop
+
+
+_ROBOT_RADIUS_M = 0.2
+_MAX_REFINEMENT_CLUSTERS = 12
+_WALL_STANDOFFS_M = (0.75, 1.5, 2.5, 3.5, 4.5)
+_WALL_LATERAL_OFFSETS_M = (-0.3, 0.0, 0.3)
+_EXACT_ROUTE_STOP_LIMIT = 40
+_HPA_CLUSTER_SIZE_M = 0.6
+_HPA_ENTRANCE_SPACING_M = 0.45
+_LAST_CANDIDATE_DEBUG: dict[str, list[tuple[int, int]] | np.ndarray] = {}
+
+
+def get_last_candidate_debug() -> dict[str, list[tuple[int, int]] | np.ndarray]:
+    """Return copies of the most recently generated candidate categories."""
+    return {name: value.copy() for name, value in _LAST_CANDIDATE_DEBUG.items()}
+
+
+def _exterior_mask(valid_mask: np.ndarray) -> np.ndarray:
+    """Return clearance-safe cells connected to the map boundary.
+
+    Floor-plan images commonly use FREE for the white background outside the
+    building.  It is physically clearance-safe but is not a valid operating
+    area, so discard every valid cell reachable from the image border.  Use
+    8-connectivity to match the path planner's movement model.
+    """
+    height, width = valid_mask.shape
+    exterior = np.zeros_like(valid_mask, dtype=bool)
+    frontier: deque[tuple[int, int]] = deque()
+
+    def add_if_valid(row: int, col: int) -> None:
+        if valid_mask[row, col] and not exterior[row, col]:
+            exterior[row, col] = True
+            frontier.append((row, col))
+
+    for row in range(height):
+        add_if_valid(row, 0)
+        add_if_valid(row, width - 1)
+    for col in range(width):
+        add_if_valid(0, col)
+        add_if_valid(height - 1, col)
+
+    while frontier:
+        row, col = frontier.popleft()
+        for row_offset in (-1, 0, 1):
+            for col_offset in (-1, 0, 1):
+                if row_offset == 0 and col_offset == 0:
+                    continue
+                neighbor_row = row + row_offset
+                neighbor_col = col + col_offset
+                if not (0 <= neighbor_row < height and 0 <= neighbor_col < width):
+                    continue
+                add_if_valid(neighbor_row, neighbor_col)
+
+    return exterior
+
+
+def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    """Keep the largest 8-connected traversable region in ``mask``.
+
+    The challenge API provides no robot start pose.  We therefore use the
+    largest enclosed, robot-traversable region as the deterministic operating
+    area and reject sealed rooms and exterior pockets behind robot-sized
+    bottlenecks.
+    """
+    height, width = mask.shape
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    component_id = 0
+    largest_component_id = 0
+    largest_component_size = 0
+
+    for row in range(height):
+        for col in range(width):
+            if not mask[row, col] or labels[row, col] != 0:
+                continue
+
+            component_id += 1
+            component_size = 0
+            frontier: deque[tuple[int, int]] = deque([(row, col)])
+            labels[row, col] = component_id
+
+            while frontier:
+                current_row, current_col = frontier.popleft()
+                component_size += 1
+                for row_offset in (-1, 0, 1):
+                    for col_offset in (-1, 0, 1):
+                        if row_offset == 0 and col_offset == 0:
+                            continue
+                        neighbor_row = current_row + row_offset
+                        neighbor_col = current_col + col_offset
+                        if not (0 <= neighbor_row < height and 0 <= neighbor_col < width):
+                            continue
+                        if mask[neighbor_row, neighbor_col] and labels[neighbor_row, neighbor_col] == 0:
+                            labels[neighbor_row, neighbor_col] = component_id
+                            frontier.append((neighbor_row, neighbor_col))
+
+            if component_size > largest_component_size:
+                largest_component_id = component_id
+                largest_component_size = component_size
+
+    if largest_component_size == 0:
+        return np.zeros_like(mask, dtype=bool)
+    return labels == largest_component_id
+
+
+def _thin_topology(binary: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning for a small, topology-scale free-space raster."""
+    image = binary.astype(np.uint8).copy()
+    while True:
+        changed = False
+        for phase in (0, 1):
+            padded = np.pad(image, 1, mode="constant", constant_values=0)
+            neighbors = [
+                padded[:-2, 1:-1], padded[:-2, 2:], padded[1:-1, 2:], padded[2:, 2:],
+                padded[2:, 1:-1], padded[2:, :-2], padded[1:-1, :-2], padded[:-2, :-2],
+            ]
+            neighbor_count = sum(neighbors)
+            transitions = sum(
+                (neighbors[index] == 0) & (neighbors[(index + 1) % 8] == 1)
+                for index in range(8)
+            )
+            if phase == 0:
+                preserve = (neighbors[0] * neighbors[2] * neighbors[4] == 0) & (
+                    neighbors[2] * neighbors[4] * neighbors[6] == 0
+                )
+            else:
+                preserve = (neighbors[0] * neighbors[2] * neighbors[6] == 0) & (
+                    neighbors[0] * neighbors[4] * neighbors[6] == 0
+                )
+            remove = (image == 1) & (neighbor_count >= 2) & (neighbor_count <= 6) & (transitions == 1) & preserve
+            if remove.any():
+                image[remove] = 0
+                changed = True
+        if not changed:
+            return image.astype(bool)
+
+
+def _topology_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
+                         coverage_range_m: float) -> list[tuple[int, int]]:
+    """Generate room/corridor features from a simplified skeleton graph."""
+    # Use a topology map at one quarter of the robot radius (5 cm for the
+    # challenge robot), removing pixel-scale wall noise before skeletonization.
+    factor = max(1, int(round((_ROBOT_RADIUS_M / 4) / grid.resolution)))
+    padded_height = int(np.ceil(grid.height / factor)) * factor
+    padded_width = int(np.ceil(grid.width / factor)) * factor
+    padded = np.pad(valid_mask, ((0, padded_height - grid.height), (0, padded_width - grid.width)))
+    topology_free = padded.reshape(padded_height // factor, factor, padded_width // factor, factor).any(axis=(1, 3))
+    skeleton = _thin_topology(topology_free)
+    height, width = skeleton.shape
+
+    padded_skeleton = np.pad(skeleton, 1, mode="constant", constant_values=False)
+    degree = np.zeros_like(skeleton, dtype=np.int8)
+    for row_offset in (-1, 0, 1):
+        for col_offset in (-1, 0, 1):
+            if row_offset != 0 or col_offset != 0:
+                degree += padded_skeleton[
+                    1 + row_offset:1 + row_offset + height,
+                    1 + col_offset:1 + col_offset + width,
+                ]
+    node_mask = skeleton & (degree != 2)
+    node_points = {tuple(map(int, point)) for point in np.argwhere(node_mask)}
+    if not node_points and skeleton.any():
+        node_points.add(tuple(map(int, np.argwhere(skeleton)[0])))
+
+    def neighbors(point: tuple[int, int]) -> list[tuple[int, int]]:
+        row, col = point
+        return [
+            (row + row_offset, col + col_offset)
+            for row_offset in (-1, 0, 1)
+            for col_offset in (-1, 0, 1)
+            if (row_offset != 0 or col_offset != 0)
+            and 0 <= row + row_offset < height and 0 <= col + col_offset < width
+            and skeleton[row + row_offset, col + col_offset]
+        ]
+
+    def edge_key(first: tuple[int, int], second: tuple[int, int]) -> tuple[tuple[int, int], tuple[int, int]]:
+        return (first, second) if first <= second else (second, first)
+
+    feature_points = set(node_points)
+    visited_edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    topology_resolution = factor * grid.resolution
+    for start in sorted(node_points):
+        for first_neighbor in neighbors(start):
+            if edge_key(start, first_neighbor) in visited_edges:
+                continue
+            path = [start]
+            previous, current = start, first_neighbor
+            while True:
+                visited_edges.add(edge_key(previous, current))
+                path.append(current)
+                if current in node_points:
+                    break
+                next_points = [point for point in neighbors(current) if point != previous]
+                if not next_points:
+                    break
+                previous, current = current, next_points[0]
+
+            segment_length = sum(
+                np.hypot(path[index + 1][0] - path[index][0], path[index + 1][1] - path[index][1])
+                for index in range(len(path) - 1)
+            ) * topology_resolution
+            segment_count = int(np.ceil(segment_length / coverage_range_m))
+            for index in range(1, segment_count):
+                target_length = segment_length * index / segment_count
+                accumulated = 0.0
+                for path_index in range(len(path) - 1):
+                    step_length = np.hypot(
+                        path[path_index + 1][0] - path[path_index][0],
+                        path[path_index + 1][1] - path[path_index][1],
+                    ) * topology_resolution
+                    accumulated += step_length
+                    if accumulated >= target_length:
+                        feature_points.add(path[path_index + 1])
+                        break
+
+    candidates: list[tuple[int, int]] = []
+    for topology_row, topology_col in sorted(feature_points):
+        row_start, col_start = topology_row * factor, topology_col * factor
+        row_end = min(row_start + factor, grid.height)
+        col_end = min(col_start + factor, grid.width)
+        valid_points = np.argwhere(valid_mask[row_start:row_end, col_start:col_end])
+        if valid_points.size == 0:
+            continue
+        center_row = (row_start + row_end - 1) / 2
+        center_col = (col_start + col_end - 1) / 2
+        rows, cols = valid_points[:, 0] + row_start, valid_points[:, 1] + col_start
+        best = int(np.argmin((rows - center_row) ** 2 + (cols - center_col) ** 2))
+        candidates.append((int(rows[best]), int(cols[best])))
+    return candidates
+
+
+def _cluster_representatives(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return wall-cell representatives of the largest 8-connected gaps."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    clusters: list[tuple[int, int, int, int]] = []  # size, first row, first col, packed centroid
+    for row, col in np.argwhere(mask):
+        row, col = int(row), int(col)
+        if visited[row, col]:
+            continue
+        frontier: deque[tuple[int, int]] = deque([(row, col)])
+        visited[row, col] = True
+        size = row_sum = col_sum = 0
+        first_row, first_col = row, col
+        points: list[tuple[int, int]] = []
+        while frontier:
+            current_row, current_col = frontier.popleft()
+            points.append((current_row, current_col))
+            size += 1
+            row_sum += current_row
+            col_sum += current_col
+            for row_offset in (-1, 0, 1):
+                for col_offset in (-1, 0, 1):
+                    if row_offset == 0 and col_offset == 0:
+                        continue
+                    neighbor_row, neighbor_col = current_row + row_offset, current_col + col_offset
+                    if (0 <= neighbor_row < height and 0 <= neighbor_col < width
+                            and mask[neighbor_row, neighbor_col] and not visited[neighbor_row, neighbor_col]):
+                        visited[neighbor_row, neighbor_col] = True
+                        frontier.append((neighbor_row, neighbor_col))
+        centroid_row = row_sum / size
+        centroid_col = col_sum / size
+        representative_row, representative_col = min(
+            points,
+            key=lambda point: ((point[0] - centroid_row) ** 2 + (point[1] - centroid_col) ** 2, point),
+        )
+        clusters.append((size, first_row, first_col, representative_row * width + representative_col))
+
+    clusters.sort(key=lambda cluster: (-cluster[0], cluster[1], cluster[2]))
+    return [(packed // width, packed % width) for _, _, _, packed in clusters[:_MAX_REFINEMENT_CLUSTERS]]
+
+
+def _wall_face_directions(grid: OccupancyGrid, row: int, col: int) -> list[tuple[int, int]]:
+    """Return directions from a wall cell toward its adjacent free-space faces."""
+    directions: list[tuple[int, int]] = []
+    for row_offset in (-1, 0, 1):
+        for col_offset in (-1, 0, 1):
+            if row_offset == 0 and col_offset == 0:
+                continue
+            neighbor_row, neighbor_col = row + row_offset, col + col_offset
+            if grid.in_bounds(neighbor_row, neighbor_col) and grid.data[neighbor_row, neighbor_col] == FREE:
+                directions.append((row_offset, col_offset))
+    return directions
+
+
+def _refinement_candidates(grid: OccupancyGrid, valid_mask: np.ndarray,
+                           gap_mask: np.ndarray, existing: set[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Generate head-on candidate views for the largest uncovered wall gaps."""
+    candidates: list[tuple[int, int]] = []
+    for wall_row, wall_col in _cluster_representatives(gap_mask):
+        for normal_row, normal_col in _wall_face_directions(grid, wall_row, wall_col):
+            normal_length = np.hypot(normal_row, normal_col)
+            unit_row, unit_col = normal_row / normal_length, normal_col / normal_length
+            lateral_row, lateral_col = -unit_col, unit_row
+            for standoff_m in _WALL_STANDOFFS_M:
+                standoff_px = standoff_m / grid.resolution
+                for lateral_offset_m in _WALL_LATERAL_OFFSETS_M:
+                    lateral_px = lateral_offset_m / grid.resolution
+                    row = int(round(wall_row + unit_row * standoff_px + lateral_row * lateral_px))
+                    col = int(round(wall_col + unit_col * standoff_px + lateral_col * lateral_px))
+                    if not (0 <= row < grid.height and 0 <= col < grid.width) or not valid_mask[row, col]:
+                        continue
+                    point = (row, col)
+                    if point not in existing:
+                        existing.add(point)
+                        candidates.append(point)
+    return candidates
+
+
+def _route_distance_matrix(
+    grid: OccupancyGrid,
+    stops: list[tuple[float, float]],
+    traversable: np.ndarray,
+) -> np.ndarray:
+    """Compute clearance-safe travel distances between all selected stops."""
+    count = len(stops)
+    distances = np.zeros((count, count), dtype=float)
+    progress_interval = max(1, count // 10)
+    print("[planner] computing clearance-safe route distances", flush=True)
+    for source_index, source_stop in enumerate(stops):
+        paths = multi_target_shortest_paths(grid, source_stop, stops, traversable)
+        for target_index, (distance_m, _) in enumerate(paths):
+            distances[source_index, target_index] = distance_m
+        if (source_index == 0 or source_index + 1 == count
+                or (source_index + 1) % progress_interval == 0):
+            print(f"[planner] route distances: {source_index + 1}/{count}", flush=True)
+    return distances
+
+
+def _routing_distance_matrix(
+    grid: OccupancyGrid,
+    stops: list[tuple[float, float]],
+    traversable: np.ndarray,
+) -> np.ndarray:
+    """Use exact routing for small plans and HPA* for larger ones."""
+    if len(stops) <= _EXACT_ROUTE_STOP_LIMIT:
+        return _route_distance_matrix(grid, stops, traversable)
+    return _hpa_route_distance_matrix(grid, stops, traversable)
+
+
+def _hpa_route_distance_matrix(
+    grid: OccupancyGrid,
+    stops: list[tuple[float, float]],
+    traversable: np.ndarray,
+) -> np.ndarray:
+    """Approximate stop distances with Hierarchical Path-Finding A* (HPA*).
+
+    The clearance-safe grid is divided into fixed-size clusters.  Consecutive
+    valid cells on a shared cluster boundary form an entrance; a small number
+    of representative entrance pairs are retained. Entrances and stops connect
+    only within their local free-space component, after which shortest paths
+    run over the compact entrance graph. Thus walls and real doorways remain
+    part of the routing model without running a whole-map Dijkstra from every
+    selected stop.
+    """
+    cluster_size = max(2, int(round(_HPA_CLUSTER_SIZE_M / grid.resolution)))
+    entrance_spacing = max(1, int(round(_HPA_ENTRANCE_SPACING_M / grid.resolution)))
+    height, width = traversable.shape
+    cluster_columns = int(np.ceil(width / cluster_size))
+    cluster_rows = int(np.ceil(height / cluster_size))
+
+    def cluster_of(cell: tuple[int, int]) -> tuple[int, int]:
+        return cell[0] // cluster_size, cell[1] // cluster_size
+
+    # Each abstract node is an actual clearance-safe raster cell.  Two nodes
+    # are created for every entrance, one in each neighbouring cluster.
+    node_cells: list[tuple[int, int]] = []
+    node_clusters: list[tuple[int, int]] = []
+    node_by_cell_cluster: dict[tuple[tuple[int, int], tuple[int, int]], int] = {}
+    graph: list[list[tuple[int, float]]] = []
+
+    def add_node(cell: tuple[int, int]) -> int:
+        key = (cell, cluster_of(cell))
+        if key in node_by_cell_cluster:
+            return node_by_cell_cluster[key]
+        index = len(node_cells)
+        node_by_cell_cluster[key] = index
+        node_cells.append(cell)
+        node_clusters.append(key[1])
+        graph.append([])
+        return index
+
+    def add_edge(first: int, second: int, cost_px: float) -> None:
+        graph[first].append((second, cost_px))
+        graph[second].append((first, cost_px))
+
+    entrance_count = 0
+
+    def add_entrances(pairs: list[tuple[tuple[int, int], tuple[int, int]]]) -> None:
+        """Add evenly spaced representatives from one continuous doorway."""
+        nonlocal entrance_count
+        pieces = max(1, int(np.ceil(len(pairs) / entrance_spacing)))
+        for piece in range(pieces):
+            pair = pairs[min(len(pairs) - 1, (piece * len(pairs) + len(pairs) // 2) // pieces)]
+            first, second = add_node(pair[0]), add_node(pair[1])
+            add_edge(first, second, float(np.hypot(pair[0][0] - pair[1][0], pair[0][1] - pair[1][1])))
+            entrance_count += 1
+
+    # Vertical and horizontal boundaries are processed separately.  A run of
+    # valid adjacencies is one physical opening, rather than one portal per
+    # raster pixel along a doorway.
+    for boundary_col in range(cluster_size, width, cluster_size):
+        run: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        for row in range(height):
+            pair = ((row, boundary_col - 1), (row, boundary_col))
+            if traversable[pair[0]] and traversable[pair[1]]:
+                run.append(pair)
+            elif run:
+                add_entrances(run)
+                run = []
+        if run:
+            add_entrances(run)
+    for boundary_row in range(cluster_size, height, cluster_size):
+        run = []
+        for col in range(width):
+            pair = ((boundary_row - 1, col), (boundary_row, col))
+            if traversable[pair[0]] and traversable[pair[1]]:
+                run.append(pair)
+            elif run:
+                add_entrances(run)
+                run = []
+        if run:
+            add_entrances(run)
+
+    stop_nodes = [add_node(grid.world_to_pixel(*stop)) for stop in stops]
+    cluster_nodes: dict[tuple[int, int], list[int]] = {}
+    for index, cluster in enumerate(node_clusters):
+        cluster_nodes.setdefault(cluster, []).append(index)
+
+    print(
+        f"[planner] HPA*: {cluster_rows}x{cluster_columns} clusters "
+        f"({cluster_size * grid.resolution:.2f} m), {entrance_count} entrances, "
+        f"{len(node_cells)} abstract nodes",
+        flush=True,
+    )
+
+    # Build local connected components.  Within this deliberately small
+    # cluster a component is represented by straight-line shortcut edges;
+    # obstacles still prevent a shortcut from crossing a disconnected local
+    # region, while the graph's portals retain all room/corridor connectivity.
+    nontrivial_clusters = [item for item in cluster_nodes.items() if len(item[1]) >= 2]
+    print(
+        f"[planner] HPA*: precomputing {len(nontrivial_clusters)} local cluster graphs",
+        flush=True,
+    )
+    for cluster_index, (cluster, nodes) in enumerate(nontrivial_clusters, start=1):
+        row_start, col_start = cluster[0] * cluster_size, cluster[1] * cluster_size
+        row_end, col_end = min(row_start + cluster_size, height), min(col_start + cluster_size, width)
+        local_mask = traversable[row_start:row_end, col_start:col_end]
+        labels = np.full(local_mask.shape, -1, dtype=np.int32)
+        component_id = 0
+        for seed_row, seed_col in np.argwhere(local_mask):
+            seed_row, seed_col = int(seed_row), int(seed_col)
+            if labels[seed_row, seed_col] != -1:
+                continue
+            frontier: deque[tuple[int, int]] = deque([(seed_row, seed_col)])
+            labels[seed_row, seed_col] = component_id
+            while frontier:
+                cell_row, cell_col = frontier.popleft()
+                for row_offset in (-1, 0, 1):
+                    for col_offset in (-1, 0, 1):
+                        if row_offset == 0 and col_offset == 0:
+                            continue
+                        neighbor_row, neighbor_col = cell_row + row_offset, cell_col + col_offset
+                        if (0 <= neighbor_row < labels.shape[0]
+                                and 0 <= neighbor_col < labels.shape[1]
+                                and local_mask[neighbor_row, neighbor_col]
+                                and labels[neighbor_row, neighbor_col] == -1):
+                            labels[neighbor_row, neighbor_col] = component_id
+                            frontier.append((neighbor_row, neighbor_col))
+            component_id += 1
+
+        nodes_by_component: dict[int, list[int]] = {}
+        for node in nodes:
+            row, col = node_cells[node]
+            component = int(labels[row - row_start, col - col_start])
+            nodes_by_component.setdefault(component, []).append(node)
+        for component_nodes in nodes_by_component.values():
+            for source_offset, source_node in enumerate(component_nodes[:-1]):
+                source_row, source_col = node_cells[source_node]
+                for target_node in component_nodes[source_offset + 1:]:
+                    target_row, target_col = node_cells[target_node]
+                    add_edge(source_node, target_node, float(np.hypot(
+                        source_row - target_row, source_col - target_col,
+                    )))
+        if (cluster_index == 1 or cluster_index == len(nontrivial_clusters)
+                or cluster_index % max(1, len(nontrivial_clusters) // 10) == 0):
+            print(
+                f"[planner] HPA* local graphs: {cluster_index}/{len(nontrivial_clusters)}",
+                flush=True,
+            )
+
+    count = len(stops)
+    distances = np.zeros((count, count), dtype=float)
+    unreachable = 0
+    print("[planner] HPA*: computing stop distances on abstract graph", flush=True)
+    for source_index, source_node in enumerate(stop_nodes):
+        pending = {node: [] for node in stop_nodes}
+        for target_index, target_node in enumerate(stop_nodes):
+            if target_index != source_index:
+                pending[target_node].append(target_index)
+        best_cost = {source_node: 0.0}
+        frontier = [(0.0, source_node)]
+        while frontier and pending:
+            cost, node = heapq.heappop(frontier)
+            if cost > best_cost.get(node, float("inf")):
+                continue
+            if node in pending:
+                for target_index in pending.pop(node):
+                    distances[source_index, target_index] = cost * grid.resolution
+            for neighbor, edge_cost in graph[node]:
+                new_cost = cost + edge_cost
+                if new_cost < best_cost.get(neighbor, float("inf")):
+                    best_cost[neighbor] = new_cost
+                    heapq.heappush(frontier, (new_cost, neighbor))
+        for target_node, target_indices in pending.items():
+            for target_index in target_indices:
+                # This should not occur in the selected connected component.
+                # Retain a finite value so tour optimisation remains stable.
+                distances[source_index, target_index] = np.hypot(
+                    stops[source_index][0] - stops[target_index][0],
+                    stops[source_index][1] - stops[target_index][1],
+                )
+                unreachable += 1
+        if source_index == 0 or source_index + 1 == count or (source_index + 1) % max(1, count // 10) == 0:
+            print(f"[planner] HPA* stop distances: {source_index + 1}/{count}", flush=True)
+    if unreachable:
+        print(f"[planner] HPA* warning: {unreachable} abstract pairs were disconnected", flush=True)
+    return np.maximum(distances, distances.T)
+
+
+def _route_length(route: list[int], distances: np.ndarray) -> float:
+    return sum(distances[route[index], route[index + 1]] for index in range(len(route) - 1))
+
+
+def _best_nearest_neighbor_route(distances: np.ndarray) -> list[int]:
+    """Try every start and retain the shortest deterministic NN open route."""
+    count = len(distances)
+    best_route: list[int] | None = None
+    best_length = float("inf")
+    for start in range(count):
+        route = [start]
+        unvisited = set(range(count))
+        unvisited.remove(start)
+        while unvisited:
+            current = route[-1]
+            next_stop = min(unvisited, key=lambda index: (distances[current, index], index))
+            route.append(next_stop)
+            unvisited.remove(next_stop)
+        length = _route_length(route, distances)
+        if length < best_length:
+            best_route = route
+            best_length = length
+    return best_route or []
+
+
+def _two_opt(route: list[int], distances: np.ndarray) -> tuple[list[int], int]:
+    """Apply deterministic first-improvement 2-opt to an open route."""
+    route = route.copy()
+    improvements = 0
+    while True:
+        improved = False
+        for first in range(len(route) - 1):
+            for last in range(first + 1, len(route)):
+                before = distances[route[first - 1], route[first]] if first else 0.0
+                after = distances[route[last], route[last + 1]] if last + 1 < len(route) else 0.0
+                existing_cost = before + after
+                replacement_before = distances[route[first - 1], route[last]] if first else 0.0
+                replacement_after = distances[route[first], route[last + 1]] if last + 1 < len(route) else 0.0
+                replacement_cost = replacement_before + replacement_after
+                if replacement_cost + 1e-9 < existing_cost:
+                    route[first:last + 1] = reversed(route[first:last + 1])
+                    improvements += 1
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            return route, improvements
+
+
+def _scan_candidates(grid: OccupancyGrid, sensor: SensorModel,
+                     candidate_pixels: list[tuple[int, int]], observable: np.ndarray,
+                     label: str) -> tuple[list[tuple[float, float]], list[set[tuple[int, int]]]]:
+    """Raycast candidates once and retain only scorer-qualifying wall cells."""
+    stops = [grid.pixel_to_world(row, col) for row, col in candidate_pixels]
+    coverage: list[set[tuple[int, int]]] = []
+    interval = max(1, len(stops) // 10)
+    for index, stop in enumerate(stops, start=1):
+        scan = scan_from_stop(grid, stop, sensor)
+        coverage.append({
+            cell for cell, quality in scan.items()
+            if quality >= sensor.min_quality and observable[cell]
+        })
+        if index == 1 or index == len(stops) or index % interval == 0:
+            print(f"[planner] raycast {label}: {index}/{len(stops)}", flush=True)
+    return stops, coverage
+
+
+def _attainable_targets(candidate_coverage: list[set[tuple[int, int]]]) -> set[tuple[int, int]]:
+    """Return wall cells visible from at least one generated valid candidate.
+
+    This is the coverage target for the candidate-set formulation.  Cells
+    outside this union may be observable in the raster scorer, but cannot be
+    reached by the particular robot-safe candidate pool, so treating them as
+    a greedy stopping criterion would add no useful stops.
+    """
+    return set().union(*candidate_coverage) if candidate_coverage else set()
+
+
+def _greedy_selection(
+    candidate_coverage: list[set[tuple[int, int]]],
+    attainable_targets: set[tuple[int, int]],
+    total_targets: int,
+) -> tuple[list[int], set[tuple[int, int]], int]:
+    """Build a greedy coverage curve and retain its deterministic knee.
+
+    The curve has normalized selected-stop count on x and normalized
+    attainable coverage on y.  The knee is the point furthest above the
+    straight line from (0, 0) to complete attainable coverage (``y - x``).
+    It captures the transition from high-return stops to the long tail of
+    small marginal gains without a hand-tuned coverage percentage.
+    """
+    covered: set[tuple[int, int]] = set()
+    selected_indices: set[int] = set()
+    selection_order: list[int] = []
+    covering_candidates: dict[tuple[int, int], list[int]] = {}
+    for candidate_index, coverage in enumerate(candidate_coverage):
+        for target in coverage:
+            covering_candidates.setdefault(target, []).append(candidate_index)
+    marginal_gain = [len(coverage) for coverage in candidate_coverage]
+    cumulative_coverage: list[int] = []
+    print("[planner] building greedy attainable-coverage curve", flush=True)
+
+    while True:
+        best_index: int | None = None
+        best_gain = 0
+        for index, gain in enumerate(marginal_gain):
+            if index not in selected_indices and gain > best_gain:
+                best_index, best_gain = index, gain
+        if best_index is None:
+            break
+
+        selected_indices.add(best_index)
+        selection_order.append(best_index)
+        newly_covered = candidate_coverage[best_index] - covered
+        covered.update(newly_covered)
+        cumulative_coverage.append(len(covered))
+        for target in newly_covered:
+            for candidate_index in covering_candidates[target]:
+                if candidate_index not in selected_indices:
+                    marginal_gain[candidate_index] -= 1
+        if len(selection_order) == 1 or len(selection_order) % 50 == 0:
+            print(
+                f"[planner] selected {len(selection_order)} stops; covered "
+                f"{len(covered)}/{len(attainable_targets)} attainable "
+                f"({len(covered)}/{total_targets} scored) wall cells",
+                flush=True,
+            )
+
+    if not selection_order or not attainable_targets:
+        return [], set(), 0
+
+    stop_count = len(selection_order)
+    attainable_count = len(attainable_targets)
+    knee_index = max(
+        range(stop_count),
+        key=lambda index: (
+            cumulative_coverage[index] / attainable_count - (index + 1) / stop_count,
+            -index,
+        ),
+    )
+    required_coverage = cumulative_coverage[knee_index]
+    selection_order = selection_order[:knee_index + 1]
+    covered = set().union(*(candidate_coverage[index] for index in selection_order))
+    print(
+        f"[planner] coverage-curve knee at stop {knee_index + 1}/{stop_count}: "
+        f"{required_coverage}/{attainable_count} attainable wall cells "
+        f"({required_coverage / attainable_count:.1%})",
+        flush=True,
+    )
+    return selection_order, covered, required_coverage
 
 
 def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[float, float]]:
-    """Replace this. The placeholder below is intentionally bad — a single
-    stop at the map's centroid — so you can see the scorer and visualization
-    working end-to-end before you touch the algorithm.
-    """
-    free_cells = grid.free_cells()
-    center_row, center_col = free_cells.mean(axis=0)
-    x, y = grid.pixel_to_world(int(center_row), int(center_col))
-    return [(x, y)]
+    """Plan stops from floor-plan topology and visibility-driven refinement."""
+    clearance_safe_mask = traversable_mask(grid, _ROBOT_RADIUS_M)
+    exterior_mask = _exterior_mask(clearance_safe_mask)
+    enclosed_mask = clearance_safe_mask & ~exterior_mask
+    valid_mask = _largest_connected_component(enclosed_mask)
+    observable = observable_wall_cells(grid)
+
+    # Skeleton graph features supply room centres, corridor junctions and
+    # sensor-range samples on long corridors without uniform map sampling.
+    effective_range_m = sensor.max_range_m * np.sqrt(1.0 - sensor.min_quality)
+    topology_pixels = _topology_candidates(grid, valid_mask, effective_range_m)
+    candidate_pixels = topology_pixels.copy()
+    existing_pixels = set(candidate_pixels)
+    print(
+        f"[planner] largest enclosed component has {int(valid_mask.sum())} cells; "
+        f"{len(candidate_pixels)} skeleton-topology candidates "
+        f"(effective range {effective_range_m:.2f} m) for "
+        f"{int(observable.sum())} observable wall cells",
+        flush=True,
+    )
+
+    candidate_stops, candidate_coverage = _scan_candidates(
+        grid, sensor, candidate_pixels, observable, "initial candidates",
+    )
+
+    # Enrich the pool where topology positions see nothing.  A later union of
+    # both scan sets defines the actual attainable target for stop selection.
+    initially_attainable = _attainable_targets(candidate_coverage)
+    gap_mask = observable.copy()
+    for row, col in initially_attainable:
+        gap_mask[row, col] = False
+    refinement_pixels = _refinement_candidates(grid, valid_mask, gap_mask, existing_pixels)
+    if refinement_pixels:
+        print(f"[planner] adding {len(refinement_pixels)} wall-normal candidates for coverage gaps", flush=True)
+        refinement_stops, refinement_coverage = _scan_candidates(
+            grid, sensor, refinement_pixels, observable, "refinement candidates",
+        )
+        candidate_pixels.extend(refinement_pixels)
+        candidate_stops.extend(refinement_stops)
+        candidate_coverage.extend(refinement_coverage)
+
+    global _LAST_CANDIDATE_DEBUG
+    _LAST_CANDIDATE_DEBUG = {
+        "topology": topology_pixels,
+        "refinement": refinement_pixels,
+        "all": candidate_pixels.copy(),
+        "clearance_safe": clearance_safe_mask.copy(),
+        "exterior": exterior_mask.copy(),
+        "enclosed": enclosed_mask.copy(),
+        "operating": valid_mask.copy(),
+    }
+
+    attainable_targets = _attainable_targets(candidate_coverage)
+    selection_order, covered, required_coverage = _greedy_selection(
+        candidate_coverage, attainable_targets, int(observable.sum()),
+    )
+
+    # A later greedy choice can make an earlier stop redundant.  Reverse
+    # deletion removes any stop whose removal keeps the knee coverage target
+    # met; it may therefore drop low-return tail stops as well as duplicated
+    # stops.
+    target_counts: dict[tuple[int, int], int] = {}
+    for candidate_index in selection_order:
+        for target in candidate_coverage[candidate_index]:
+            target_counts[target] = target_counts.get(target, 0) + 1
+
+    retained_indices = set(selection_order)
+    for candidate_index in reversed(selection_order):
+        uniquely_covered = [
+            target for target in candidate_coverage[candidate_index]
+            if target_counts[target] == 1
+        ]
+        if len(covered) - len(uniquely_covered) >= required_coverage:
+            retained_indices.remove(candidate_index)
+            for target in candidate_coverage[candidate_index]:
+                target_counts[target] -= 1
+            covered.difference_update(uniquely_covered)
+
+    removed_count = len(selection_order) - len(retained_indices)
+    selected = [
+        candidate_stops[candidate_index]
+        for candidate_index in selection_order
+        if candidate_index in retained_indices
+    ]
+    print(
+        f"[planner] pruned {removed_count} redundant stops; "
+        f"finished with {len(selected)} stops; "
+        f"covered {len(covered)}/{len(attainable_targets)} attainable wall cells "
+        f"({len(covered) / len(attainable_targets) if attainable_targets else 0.0:.1%}); "
+        f"{len(covered)}/{int(observable.sum())} scorer wall cells",
+        flush=True,
+    )
+
+    if len(selected) > 1:
+        route_distances = _routing_distance_matrix(grid, selected, valid_mask)
+        route = _best_nearest_neighbor_route(route_distances)
+        nearest_neighbor_length = _route_length(route, route_distances)
+        route, two_opt_improvements = _two_opt(route, route_distances)
+        optimized_length = _route_length(route, route_distances)
+        selected = [selected[index] for index in route]
+        print(
+            f"[planner] route optimization: {nearest_neighbor_length:.1f} m -> "
+            f"{optimized_length:.1f} m with {two_opt_improvements} 2-opt improvements",
+            flush=True,
+        )
+    return selected

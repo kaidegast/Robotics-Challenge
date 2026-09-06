@@ -5,10 +5,8 @@ cast a dense ring of rays, walk each one cell-by-cell (DDA) until it hits an
 occupied (wall) cell or exceeds max_range, and record that wall cell as
 "observed" from this stop, with a quality score that falls off with range.
 
-Deliberately not modeled: incidence angle relative to the wall's local surface
-normal (a real scanner sees a wall obliquely-struck less well than one hit
-head-on). That's a legitimate axis for a strong candidate to add — the hook is
-`quality_at_range()` below.
+Quality combines the existing range falloff with a wall-incidence term: a real
+scanner sees an obliquely struck wall less accurately than one struck head-on.
 """
 from __future__ import annotations
 
@@ -19,6 +17,15 @@ import numpy as np
 from .map_io import FREE, OCCUPIED, OccupancyGrid
 
 
+_FACE_DIRECTIONS = tuple(
+    (row_offset, col_offset)
+    for row_offset in (-1, 0, 1)
+    for col_offset in (-1, 0, 1)
+    if row_offset != 0 or col_offset != 0
+)
+_INCIDENCE_EXPONENT = 1.0
+
+
 @dataclass
 class SensorModel:
     max_range_m: float = 16
@@ -26,12 +33,56 @@ class SensorModel:
     min_quality: float = 0.5  # a wall cell only counts as "scanned" if observed at >= this quality
 
 
-def quality_at_range(range_m: float, max_range_m: float) -> float:
+def quality_at_range(range_m: float, max_range_m: float,
+                     incidence_cos: float | np.ndarray = 1.0) -> float | np.ndarray:
     """Quadratic falloff: 1.0 at range 0, 0.0 at max_range. Depth uncertainty
     for real range sensors (stereo, ToF) grows with range^2, so quality drops
-    off faster near max_range than a linear model would. Works for a scalar
-    range or a numpy array of ranges alike."""
-    return np.maximum(0.0, 1.0 - (range_m / max_range_m) ** 2)
+    off faster near max_range than a linear model would. ``incidence_cos`` is
+    the cosine between an exposed wall-face normal and the wall-to-scanner
+    direction: 1.0 is head-on and 0.0 is grazing. The product models the
+    weaker return and poorer surface localization of oblique measurements.
+    Works for scalar or numpy-array inputs alike."""
+    distance_quality = np.maximum(0.0, 1.0 - (range_m / max_range_m) ** 2)
+    incidence_quality = np.clip(incidence_cos, 0.0, 1.0) ** _INCIDENCE_EXPONENT
+    return distance_quality * incidence_quality
+
+
+def _wall_face_masks(grid: OccupancyGrid) -> np.ndarray:
+    """Return cached exposed wall faces indexed by cell and neighbor direction."""
+    cached = getattr(grid, "_wall_face_masks", None)
+    if cached is not None:
+        return cached
+
+    free = grid.data == FREE
+    padded_free = np.pad(free, 1, mode="constant", constant_values=False)
+    occupied = grid.data == OCCUPIED
+    faces = np.zeros((*grid.data.shape, len(_FACE_DIRECTIONS)), dtype=bool)
+    for index, (row_offset, col_offset) in enumerate(_FACE_DIRECTIONS):
+        neighbor_free = padded_free[
+            1 + row_offset:1 + row_offset + grid.height,
+            1 + col_offset:1 + col_offset + grid.width,
+        ]
+        faces[:, :, index] = occupied & neighbor_free
+    grid._wall_face_masks = faces  # type: ignore[attr-defined]
+    return faces
+
+
+def _incidence_cosines(grid: OccupancyGrid, origin_row: int, origin_col: int,
+                        hit_rows: np.ndarray, hit_cols: np.ndarray,
+                        range_px: np.ndarray) -> np.ndarray:
+    """Return the most head-on exposed-face cosine for each wall hit."""
+    faces = _wall_face_masks(grid)
+    to_sensor_row = origin_row - hit_rows
+    to_sensor_col = origin_col - hit_cols
+    best_cosine = np.zeros(len(hit_rows), dtype=float)
+    for face_index, (row_offset, col_offset) in enumerate(_FACE_DIRECTIONS):
+        face_exists = faces[hit_rows, hit_cols, face_index]
+        if not face_exists.any():
+            continue
+        face_length = np.hypot(row_offset, col_offset)
+        cosine = (row_offset * to_sensor_row + col_offset * to_sensor_col) / (face_length * range_px)
+        best_cosine = np.maximum(best_cosine, np.where(face_exists, cosine, 0.0))
+    return np.clip(best_cosine, 0.0, 1.0)
 
 
 def scan_from_stop(grid: OccupancyGrid, stop_xy: tuple[float, float],
@@ -73,7 +124,12 @@ def scan_from_stop(grid: OccupancyGrid, stop_xy: tuple[float, float],
         hit_now = active & occ_now
         if hit_now.any():
             range_px = np.hypot(ir[hit_now] - origin_row, ic[hit_now] - origin_col)
-            quality = quality_at_range(range_px * grid.resolution, sensor.max_range_m)
+            incidence_cos = _incidence_cosines(
+                grid, origin_row, origin_col, ir[hit_now], ic[hit_now], range_px,
+            )
+            quality = quality_at_range(
+                range_px * grid.resolution, sensor.max_range_m, incidence_cos,
+            )
             for row, col, q in zip(ir[hit_now], ic[hit_now], quality):
                 cell = (int(row), int(col))
                 if q > seen.get(cell, 0.0):
