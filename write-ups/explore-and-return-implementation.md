@@ -82,6 +82,26 @@
   derived from `map -> odom` immediately before every attempt. Only a
   successful Nav2 return permits calling `/finish_exploration`.
 
+### Debugging Logs and Frontier Visualisation
+
+- The node publishes `/frontier_candidates` as a
+  `visualization_msgs/MarkerArray`. The supplied RViz configuration displays
+  this topic in the `map` frame. Each valid component is shown as points and
+  its selected Nav2 goal as a sphere.
+- Valid candidates are ranked and coloured by score: the best is red, ranks
+  two through five fade from red toward grey, and all lower-ranked valid
+  frontiers are grey.
+- A temporarily blacklisted goal is shown in black. Invalid frontier
+  components use a reason-specific colour: purple for `too_small`, blue for
+  `unreachable`, orange for `too_close`, magenta for `no_safe_start`, and
+  green for `insufficient_information_gain`.
+- For each new map revision, the node logs the total number of raw frontier
+  components, the valid, blacklisted, and invalid counts, plus invalid-reason
+  counts. It prints the top five valid candidates with their score, frontier
+  length, raw ray-cast information gain, weighted information-gain term, path
+  length, and world-coordinate goal. This makes it possible to compare the
+  numeric ranking directly with the RViz colours.
+
 ## Design Decisions & Tradeoffs
 
 - **Coverage versus safety:** The planner uses observed safe-free cells and
