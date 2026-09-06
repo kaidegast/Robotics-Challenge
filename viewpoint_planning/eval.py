@@ -32,10 +32,12 @@ def render_candidate_debug(grid, candidates: dict[str, object], out_path: Path) 
     import matplotlib.pyplot as plt
     import numpy as np
 
+    from sim.map_io import FREE, OCCUPIED, UNKNOWN
+
     rgb = np.zeros((grid.height, grid.width, 3), dtype=np.uint8)
-    rgb[grid.data == 0] = (255, 255, 255)
-    rgb[grid.data == 1] = (45, 45, 45)
-    rgb[grid.data == 2] = (205, 205, 205)
+    rgb[grid.data == FREE] = (255, 255, 255)
+    rgb[grid.data == OCCUPIED] = (45, 45, 45)
+    rgb[grid.data == UNKNOWN] = (205, 205, 205)
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.imshow(rgb)
 
@@ -120,6 +122,8 @@ def main() -> None:
                         help="Save a candidate_positions.png debug image alongside the report")
     parser.add_argument("--debug-areas", action="store_true",
                         help="Save an area_classification.png planner-mask debug image")
+    parser.add_argument("--progress", action="store_true",
+                        help="Print scorer progress while evaluating scans and route segments")
     args = parser.parse_args()
 
     grid = load_occupancy_grid(args.map)
@@ -137,7 +141,7 @@ def main() -> None:
 
     print("[eval] scoring coverage and tour", flush=True)
     report = score_solution(
-        grid, stops, sensor, robot_radius_m=ROBOT_RADIUS_M, progress=True,
+        grid, stops, sensor, robot_radius_m=ROBOT_RADIUS_M, progress=args.progress,
     )
 
     print(f"Map:              {args.map}")
