@@ -112,10 +112,24 @@ keeps the initial pool compact while still handling difficult wall geometry.
 
 ### 5. Order the tour
 
-- I calculate a pairwise travel-distance matrix using the provided
-  clearance-safe shortest-path planner and the same `valid_mask` used for the
-  candidates. This measures drivable distance around walls rather than
-  straight-line distance through them.
+- For plans with at most 40 stops, I calculate the full pairwise,
+  clearance-safe shortest-path matrix using the provided path planner. This
+  measures drivable distance around walls rather than straight-line distance
+  through them.
+- For larger plans, a full-resolution path search from every stop is too slow.
+  I use a hierarchical pathfinding abstraction (HPA*): the clearance-safe grid
+  is divided into 0.6 m clusters. Runs of valid cells crossing a cluster
+  boundary become a small number of actual doorway/region entrances. Stops and
+  entrances connect only when they share a local free-space component; the
+  tour distances are then shortest paths through this compact entrance graph.
+  This preserves the map's room, corridor, and doorway connectivity without a
+  whole-map search from every stop.
+- HPA* was added because exact routing needs one whole-map Dijkstra search per
+  selected stop. This was acceptable for small tours, but dominated planning
+  time on the 65- and 96-stop maps. It changes only the distance estimates
+  used to order already-selected stops: candidate generation, coverage, and
+  stop count are unchanged. The evaluator still calculates the final tour on
+  the original clearance-safe grid.
 - The challenge provides no robot start pose. With `N` selected stops, I build
   `N` nearest-neighbour routes, using each stop once as the starting point.
   Each route repeatedly visits the closest unvisited stop according to the
@@ -176,15 +190,18 @@ from the robot's selected indoor operating area.
 
 | Map | Coverage | Covered cells | Stops | Tour length | Planning time |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 38.4% | 6,164 / 16,066 | 28 | 47.4 m | 26.2 s |
-| 2 | 35.2% | 19,501 / 55,421 | 96 | 168.5 m | 221.5 s |
-| 3 | 37.3% | 14,136 / 37,909 | 65 | 115.9 m | 172.3 s |
+| 1 | 38.4% | 6,164 / 16,066 | 28 | 47.4 m | 25.8 s |
+| 2 | 35.2% | 19,501 / 55,421 | 96 | 163.0 m | 26.0 s |
+| 3 | 37.3% | 14,136 / 37,909 | 65 | 116.1 m | 24.8 s |
 | 4 | 32.8% | 2,587 / 7,885 | 12 | 13.7 m | 2.9 s |
 | 5 | 38.3% | 6,150 / 16,066 | 29 | 42.5 m | 16.8 s |
 
 - All five runs produced zero invalid stops.
 - Planning and candidate selection are deterministic; no random sampling or
   random seed is used.
+- Maps 2 and 3 exceed the 40-stop cutoff and therefore use HPA*; the other
+  maps use the exact full-resolution routing matrix. In particular, map 2's
+  planning time fell from the exact-routing run of 221.5 s to 26.0 s.
 
 <p align="center">
   <img src="../viewpoint_planning/results/20260905_220856/area_classification.png" alt="Map 4 area classification" width="33%" />
@@ -200,8 +217,11 @@ from the robot's selected indoor operating area.
 - The largest enclosed component is a practical proxy because the task has no
   robot start pose. A supplied start pose would allow selecting its reachable
   component exactly.
-- The nearest-neighbour routes are calculated with every starting point the task has no
-  robot start pose
+- HPA* routing is an approximation on large plans. Its local cluster links are
+  straight-line shortcuts within a connected free-space component, so a wall
+  detour contained entirely inside one cluster can be underestimated. The
+  evaluator always reports the true clearance-safe route length, and every
+  inter-cluster connection is still a real traversable entrance.
 - The curve-knee rule is heuristic and may choose too few or too many stops
   on unusually shaped coverage curves. A tunable minimum coverage floor or a
   cost-aware objective could make that tradeoff explicit.

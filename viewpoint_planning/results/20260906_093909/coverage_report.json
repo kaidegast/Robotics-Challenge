@@ -1,6 +1,6 @@
 {
   "map": "maps/1/room.yaml",
-  "planning_time_s": 25.77403041801881,
+  "planning_time_s": 25.843251309008338,
   "coverage_fraction": 0.38366737209012824,
   "covered_wall_cells": 6164,
   "total_wall_cells": 16066,

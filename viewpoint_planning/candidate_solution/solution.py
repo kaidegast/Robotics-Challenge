@@ -13,6 +13,7 @@ See README.md for the full brief, scoring rubric, and how to run
 from __future__ import annotations
 
 from collections import deque
+import heapq
 
 import numpy as np
 
@@ -25,6 +26,9 @@ _ROBOT_RADIUS_M = 0.2
 _MAX_REFINEMENT_CLUSTERS = 12
 _WALL_STANDOFFS_M = (0.75, 1.5, 2.5, 3.5, 4.5)
 _WALL_LATERAL_OFFSETS_M = (-0.3, 0.0, 0.3)
+_EXACT_ROUTE_STOP_LIMIT = 40
+_HPA_CLUSTER_SIZE_M = 0.6
+_HPA_ENTRANCE_SPACING_M = 0.45
 _LAST_CANDIDATE_DEBUG: dict[str, list[tuple[int, int]] | np.ndarray] = {}
 
 
@@ -435,6 +439,208 @@ def _route_distance_matrix(
     return distances
 
 
+def _routing_distance_matrix(
+    grid: OccupancyGrid,
+    stops: list[tuple[float, float]],
+    traversable: np.ndarray,
+) -> np.ndarray:
+    """Use exact routing for small plans and HPA* for larger ones."""
+    if len(stops) <= _EXACT_ROUTE_STOP_LIMIT:
+        return _route_distance_matrix(grid, stops, traversable)
+    return _hpa_route_distance_matrix(grid, stops, traversable)
+
+
+def _hpa_route_distance_matrix(
+    grid: OccupancyGrid,
+    stops: list[tuple[float, float]],
+    traversable: np.ndarray,
+) -> np.ndarray:
+    """Approximate stop distances with Hierarchical Path-Finding A* (HPA*).
+
+    The clearance-safe grid is divided into fixed-size clusters.  Consecutive
+    valid cells on a shared cluster boundary form an entrance; a small number
+    of representative entrance pairs are retained. Entrances and stops connect
+    only within their local free-space component, after which shortest paths
+    run over the compact entrance graph. Thus walls and real doorways remain
+    part of the routing model without running a whole-map Dijkstra from every
+    selected stop.
+    """
+    cluster_size = max(2, int(round(_HPA_CLUSTER_SIZE_M / grid.resolution)))
+    entrance_spacing = max(1, int(round(_HPA_ENTRANCE_SPACING_M / grid.resolution)))
+    height, width = traversable.shape
+    cluster_columns = int(np.ceil(width / cluster_size))
+    cluster_rows = int(np.ceil(height / cluster_size))
+
+    def cluster_of(cell: tuple[int, int]) -> tuple[int, int]:
+        return cell[0] // cluster_size, cell[1] // cluster_size
+
+    # Each abstract node is an actual clearance-safe raster cell.  Two nodes
+    # are created for every entrance, one in each neighbouring cluster.
+    node_cells: list[tuple[int, int]] = []
+    node_clusters: list[tuple[int, int]] = []
+    node_by_cell_cluster: dict[tuple[tuple[int, int], tuple[int, int]], int] = {}
+    graph: list[list[tuple[int, float]]] = []
+
+    def add_node(cell: tuple[int, int]) -> int:
+        key = (cell, cluster_of(cell))
+        if key in node_by_cell_cluster:
+            return node_by_cell_cluster[key]
+        index = len(node_cells)
+        node_by_cell_cluster[key] = index
+        node_cells.append(cell)
+        node_clusters.append(key[1])
+        graph.append([])
+        return index
+
+    def add_edge(first: int, second: int, cost_px: float) -> None:
+        graph[first].append((second, cost_px))
+        graph[second].append((first, cost_px))
+
+    entrance_count = 0
+
+    def add_entrances(pairs: list[tuple[tuple[int, int], tuple[int, int]]]) -> None:
+        """Add evenly spaced representatives from one continuous doorway."""
+        nonlocal entrance_count
+        pieces = max(1, int(np.ceil(len(pairs) / entrance_spacing)))
+        for piece in range(pieces):
+            pair = pairs[min(len(pairs) - 1, (piece * len(pairs) + len(pairs) // 2) // pieces)]
+            first, second = add_node(pair[0]), add_node(pair[1])
+            add_edge(first, second, float(np.hypot(pair[0][0] - pair[1][0], pair[0][1] - pair[1][1])))
+            entrance_count += 1
+
+    # Vertical and horizontal boundaries are processed separately.  A run of
+    # valid adjacencies is one physical opening, rather than one portal per
+    # raster pixel along a doorway.
+    for boundary_col in range(cluster_size, width, cluster_size):
+        run: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        for row in range(height):
+            pair = ((row, boundary_col - 1), (row, boundary_col))
+            if traversable[pair[0]] and traversable[pair[1]]:
+                run.append(pair)
+            elif run:
+                add_entrances(run)
+                run = []
+        if run:
+            add_entrances(run)
+    for boundary_row in range(cluster_size, height, cluster_size):
+        run = []
+        for col in range(width):
+            pair = ((boundary_row - 1, col), (boundary_row, col))
+            if traversable[pair[0]] and traversable[pair[1]]:
+                run.append(pair)
+            elif run:
+                add_entrances(run)
+                run = []
+        if run:
+            add_entrances(run)
+
+    stop_nodes = [add_node(grid.world_to_pixel(*stop)) for stop in stops]
+    cluster_nodes: dict[tuple[int, int], list[int]] = {}
+    for index, cluster in enumerate(node_clusters):
+        cluster_nodes.setdefault(cluster, []).append(index)
+
+    print(
+        f"[planner] HPA*: {cluster_rows}x{cluster_columns} clusters "
+        f"({cluster_size * grid.resolution:.2f} m), {entrance_count} entrances, "
+        f"{len(node_cells)} abstract nodes",
+        flush=True,
+    )
+
+    # Build local connected components.  Within this deliberately small
+    # cluster a component is represented by straight-line shortcut edges;
+    # obstacles still prevent a shortcut from crossing a disconnected local
+    # region, while the graph's portals retain all room/corridor connectivity.
+    nontrivial_clusters = [item for item in cluster_nodes.items() if len(item[1]) >= 2]
+    print(
+        f"[planner] HPA*: precomputing {len(nontrivial_clusters)} local cluster graphs",
+        flush=True,
+    )
+    for cluster_index, (cluster, nodes) in enumerate(nontrivial_clusters, start=1):
+        row_start, col_start = cluster[0] * cluster_size, cluster[1] * cluster_size
+        row_end, col_end = min(row_start + cluster_size, height), min(col_start + cluster_size, width)
+        local_mask = traversable[row_start:row_end, col_start:col_end]
+        labels = np.full(local_mask.shape, -1, dtype=np.int32)
+        component_id = 0
+        for seed_row, seed_col in np.argwhere(local_mask):
+            seed_row, seed_col = int(seed_row), int(seed_col)
+            if labels[seed_row, seed_col] != -1:
+                continue
+            frontier: deque[tuple[int, int]] = deque([(seed_row, seed_col)])
+            labels[seed_row, seed_col] = component_id
+            while frontier:
+                cell_row, cell_col = frontier.popleft()
+                for row_offset in (-1, 0, 1):
+                    for col_offset in (-1, 0, 1):
+                        if row_offset == 0 and col_offset == 0:
+                            continue
+                        neighbor_row, neighbor_col = cell_row + row_offset, cell_col + col_offset
+                        if (0 <= neighbor_row < labels.shape[0]
+                                and 0 <= neighbor_col < labels.shape[1]
+                                and local_mask[neighbor_row, neighbor_col]
+                                and labels[neighbor_row, neighbor_col] == -1):
+                            labels[neighbor_row, neighbor_col] = component_id
+                            frontier.append((neighbor_row, neighbor_col))
+            component_id += 1
+
+        nodes_by_component: dict[int, list[int]] = {}
+        for node in nodes:
+            row, col = node_cells[node]
+            component = int(labels[row - row_start, col - col_start])
+            nodes_by_component.setdefault(component, []).append(node)
+        for component_nodes in nodes_by_component.values():
+            for source_offset, source_node in enumerate(component_nodes[:-1]):
+                source_row, source_col = node_cells[source_node]
+                for target_node in component_nodes[source_offset + 1:]:
+                    target_row, target_col = node_cells[target_node]
+                    add_edge(source_node, target_node, float(np.hypot(
+                        source_row - target_row, source_col - target_col,
+                    )))
+        if (cluster_index == 1 or cluster_index == len(nontrivial_clusters)
+                or cluster_index % max(1, len(nontrivial_clusters) // 10) == 0):
+            print(
+                f"[planner] HPA* local graphs: {cluster_index}/{len(nontrivial_clusters)}",
+                flush=True,
+            )
+
+    count = len(stops)
+    distances = np.zeros((count, count), dtype=float)
+    unreachable = 0
+    print("[planner] HPA*: computing stop distances on abstract graph", flush=True)
+    for source_index, source_node in enumerate(stop_nodes):
+        pending = {node: [] for node in stop_nodes}
+        for target_index, target_node in enumerate(stop_nodes):
+            if target_index != source_index:
+                pending[target_node].append(target_index)
+        best_cost = {source_node: 0.0}
+        frontier = [(0.0, source_node)]
+        while frontier and pending:
+            cost, node = heapq.heappop(frontier)
+            if cost > best_cost.get(node, float("inf")):
+                continue
+            if node in pending:
+                for target_index in pending.pop(node):
+                    distances[source_index, target_index] = cost * grid.resolution
+            for neighbor, edge_cost in graph[node]:
+                new_cost = cost + edge_cost
+                if new_cost < best_cost.get(neighbor, float("inf")):
+                    best_cost[neighbor] = new_cost
+                    heapq.heappush(frontier, (new_cost, neighbor))
+        for target_node, target_indices in pending.items():
+            for target_index in target_indices:
+                # This should not occur in the selected connected component.
+                # Retain a finite value so tour optimisation remains stable.
+                distances[source_index, target_index] = np.hypot(
+                    stops[source_index][0] - stops[target_index][0],
+                    stops[source_index][1] - stops[target_index][1],
+                )
+                unreachable += 1
+        if source_index == 0 or source_index + 1 == count or (source_index + 1) % max(1, count // 10) == 0:
+            print(f"[planner] HPA* stop distances: {source_index + 1}/{count}", flush=True)
+    if unreachable:
+        print(f"[planner] HPA* warning: {unreachable} abstract pairs were disconnected", flush=True)
+    return np.maximum(distances, distances.T)
+
+
 def _route_length(route: list[int], distances: np.ndarray) -> float:
     return sum(distances[route[index], route[index + 1]] for index in range(len(route) - 1))
 
@@ -683,7 +889,7 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     )
 
     if len(selected) > 1:
-        route_distances = _route_distance_matrix(grid, selected, valid_mask)
+        route_distances = _routing_distance_matrix(grid, selected, valid_mask)
         route = _best_nearest_neighbor_route(route_distances)
         nearest_neighbor_length = _route_length(route, route_distances)
         route, two_opt_improvements = _two_opt(route, route_distances)
