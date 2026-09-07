@@ -4,27 +4,27 @@
 
 ### 1. Find valid areas
 
-- I build a free-space mask with the required 0.2 m robot clearance. (clearance_safe_mask)
-- I remove clearance-safe cells connected to the map boundary as exterior
-  space (`exterior_mask`), producing the enclosed mask (`enclosed_mask`). I
-  then split the enclosed mask into connected components and retain the
+- A free-space mask is built with the required 0.2 m robot clearance. (clearance_safe_mask)
+- Clearance-safe cells connected to the map boundary are removed as exterior
+  space (`exterior_mask`), producing the enclosed mask (`enclosed_mask`). The
+  enclosed mask is then split into connected components, retaining the
   largest one as the operating area (`valid_mask`).
 - This prevents stops outside the building, behind robot-sized gaps, or in
   sealed rooms.
 
 ### 2. Generate candidate viewpoints
 
-I use two complementary candidate types. Topology candidates answer “where
+The planner uses two complementary candidate types. Topology candidates answer “where
 are useful, safe places in the building to stand?”, while wall-normal
 refinement candidates answer “where should the robot stand to obtain a direct,
 high-quality view of a wall that those general positions miss?” Using both
 keeps the initial pool compact while still handling difficult wall geometry.
 
 #### Topology candidates
-- I first reduce the valid free-space mask to a coarser topology map (about
+- The valid free-space mask is first reduced to a coarser topology map (about
   5 cm cells). This suppresses pixel-scale noise and thick/jagged raster
   walls, which would otherwise create many false skeleton branches.
-- I then thin this coarse free-space map into a one-cell-wide centre-line
+- This coarse free-space map is then thinned into a one-cell-wide centre-line
   skeleton. It is a raster approximation of the geometric medial axis: it
   captures the main centre lines of rooms and corridors without requiring
   exact continuous wall geometry (Zhang-Suen).
@@ -51,14 +51,14 @@ keeps the initial pool compact while still handling difficult wall geometry.
 
 #### Wall-normal refinement
 
-- I first raycast all topology candidates. A coverage gap is a scorer-
+- All topology candidates are first raycast. A coverage gap is a scorer-
   observable wall cell that none of those candidates can see at the required
   quality.
-- I group those gaps into wall regions and use representatives from the
-  largest regions. For each representative wall cell, I identify the adjacent
-  free-space direction: this is the wall-face normal pointing away from the
+- These gaps are grouped into wall regions, using representatives from the
+  largest regions. For each representative wall cell, the adjacent
+  free-space direction is identified. This is the wall-face normal pointing away from the
   wall.
-- I generate positions along that normal at 0.75, 1.5, 2.5, 3.5, and 4.5 m,
+- Positions are generated along that normal at 0.75, 1.5, 2.5, 3.5, and 4.5 m,
   with lateral offsets of -0.3, 0, and +0.3 m. Only points in the clearance-
   safe operating region are retained.
 - This supplies targeted alternatives for corners, recessed alcoves, hidden
@@ -68,7 +68,7 @@ keeps the initial pool compact while still handling difficult wall geometry.
 
 ### 3. Measure what each viewpoint sees
 
-- I simulate one full 360-degree scan from each candidate and cache the wall
+- One full 360-degree scan is simulated from each candidate and the wall
   cells reached by its rays. A ray stops at the first wall cell it hits, so
   walls behind another wall are occluded.
 - A wall cell counts as covered only if its scan quality is at least the
@@ -89,35 +89,35 @@ keeps the initial pool compact while still handling difficult wall geometry.
 
 ### 4. Select the stops
 
-- I apply deterministic greedy set cover: repeatedly select the candidate
+- Deterministic greedy set cover is applied: repeatedly select the candidate
   that adds the most previously unseen wall cells.
-- After every greedy choice, I record the cumulative attainable coverage. This
+- After every greedy choice, the cumulative attainable coverage is recorded. This
   produces a curve with selected-stop fraction on the x-axis and attainable-
   coverage fraction on the y-axis.
-- I first build the whole greedy curve, then select its knee: the point with
+- The whole greedy curve is first built, then its knee is selected: the point with
   the largest `coverage_fraction - stop_fraction`. Geometrically, this is the
   point furthest above the straight line from “zero stops, zero coverage” to
   “all greedy stops, full attainable coverage”. It marks the transition from
   high-return stops to the long tail where each extra stop adds little new
   coverage. The metric is scale-independent: it compares fractions, so it
   does not depend on the number of map pixels or generated candidates.
-- I deliberately do not set a fixed minimum-coverage percentage. A fixed
+- No fixed minimum-coverage percentage is set. A fixed
   value such as 90% can be arbitrary across maps with different geometry and
   candidate pools; the knee adapts to the actual coverage trade-off. The
   caveat is that it can select too little coverage on an unusual curve. If a
-  minimum coverage guarantee were required, I would choose the later of the
-  knee stop and the first stop reaching that coverage floor.
-- I then remove any selected stop that can be deleted without falling below
-  the knee coverage level.
+  minimum coverage guarantee were required, the later of the knee stop and
+  the first stop reaching that coverage floor would be selected.
+- Any selected stop that can be deleted without falling below the knee
+  coverage level is removed.
 
 ### 5. Order the tour
 
-- For plans with at most 40 stops, I calculate the full pairwise,
-  clearance-safe shortest-path matrix using the provided path planner. This
+- For plans with at most 40 stops, the full pairwise, clearance-safe
+  shortest-path matrix is calculated using the provided path planner. This
   measures drivable distance around walls rather than straight-line distance
   through them.
 - For larger plans, a full-resolution path search from every stop is too slow.
-  I use a hierarchical pathfinding abstraction (HPA*): the clearance-safe grid
+  A hierarchical pathfinding abstraction (HPA*) is used: the clearance-safe grid
   is divided into 0.6 m clusters. Runs of valid cells crossing a cluster
   boundary become a small number of actual doorway/region entrances. Stops and
   entrances connect only when they share a local free-space component; the
@@ -130,12 +130,12 @@ keeps the initial pool compact while still handling difficult wall geometry.
   used to order already-selected stops: candidate generation, coverage, and
   stop count are unchanged. The evaluator still calculates the final tour on
   the original clearance-safe grid.
-- The challenge provides no robot start pose. With `N` selected stops, I build
-  `N` nearest-neighbour routes, using each stop once as the starting point.
+- The challenge provides no robot start pose. With `N` selected stops,
+  `N` nearest-neighbour routes are built, using each stop once as the starting point.
   Each route repeatedly visits the closest unvisited stop according to the
-  shortest-path distance matrix. I retain the shortest of these routes. The
+  shortest-path distance matrix. The shortest of these routes is retained. The
   result is an open tour: it does not return to its first stop.
-- I improve that nearest-neighbour route with deterministic 2-opt. 2-opt
+- That nearest-neighbour route is improved with deterministic 2-opt. 2-opt
   repeatedly tests whether reversing a contiguous route section shortens the
   total path; if so, it keeps the reversal. This removes local crossings and
   backtracking without changing the selected viewpoints or their coverage.
@@ -228,7 +228,7 @@ from the robot's selected indoor operating area.
   cost-aware objective could make that tradeoff explicit.
 - Wall-normal refinement is limited to the largest uncovered clusters; small
   but important regions may be missed.
-- With more time, I would compare against an ILP/set-cover formulation after
+- With more time, an ILP/set-cover formulation could be compared after
   candidate generation, and use stronger tour optimization or jointly
   optimize coverage and travel cost.
 - Nearest-neighbour plus 2-opt is a fast routing heuristic, not an exact
