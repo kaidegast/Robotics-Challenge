@@ -65,11 +65,14 @@
 - Before navigation, the selected target obtains a Nav2 predicted path. The
   yaw sent in `NavigateToPose` is the direction of that path's final segment,
   so the robot normally arrives aligned with its required final yaw instead of
-  rotating in place. The supplied Nav2 controller and goal-checker settings
-  are not modified.
-- The candidate costmaps use a 0.23 m Nav2 robot radius. Their inflation
-  layers use `inflation_radius=1.75` and `cost_scaling_factor=2.58`, making
-  obstacle-adjacent routes less attractive and reducing collision risk.
+  rotating in place. This yaw has no exploration value for this robot; it is a
+  compatibility workaround for the supplied Nav2 goal checker, whose final
+  orientation requirement cannot be removed from the candidate solution. The
+  supplied Nav2 controller and goal-checker settings are not modified.
+- The evaluation costmaps use a 0.23 m Nav2 robot radius. This reduced
+  collisions, but it is a conservative workaround rather than a model of the
+  real robot. Their inflation layers use `inflation_radius=1.75` and
+  `cost_scaling_factor=2.58`, making obstacle-adjacent routes less attractive.
 
 ### Execution, Blacklisting, and Return
 
@@ -108,13 +111,22 @@
   clearance filtering. This avoids risky wall-adjacent goals, but a large
   clearance margin can hide narrow doorways. The default margin is therefore
   zero.
+- **Collision workaround versus navigation tuning:** Increasing Nav2's robot
+  radius to 0.23 m prevented collisions in the evaluated runs, but can reject
+  space that the real robot could traverse. It is preferable to model the
+  real footprint accurately and tune obstacle costs when the project scope
+  permits it.
 - **Information gain versus planning cost:** Ray-casting is more informative
   than frontier length alone but scales with the number of candidates. The
-  two-stage ranking caps normal work at 20 ray-casts per batch while still
+  two-stage ranking caps the max number of ray-casts per batch while still
   allowing later candidates to be considered.
 - **Local planning versus Nav2:** Dijkstra cheaply evaluates the map once per
   cycle. Nav2 is reserved for candidates that the conservative local grid
   cannot connect and for deriving the selected goal's arrival yaw.
+- **Final yaw versus scope:** The task does not require a particular robot
+  orientation at a frontier. Rather than modifying Nav2's out-of-scope goal
+  checker, the explorer uses the final predicted path tangent so the stock
+  orientation check is satisfied without a separate turn.
 - **Short travel versus map gain:** The weighted path term discourages
   back-and-forth trips, but does not make distant high-gain frontiers
   impossible to select.
@@ -137,25 +149,40 @@ challenge container. It covers map coarsening, coordinate conversion,
 clearance, frontier thresholding, reachability, ranking, exclusion zones,
 ray-casting, and the bounded ray-cast batch limit.
 
-No final coverage claim is recorded here. Full evaluation should use fixed
-map/seed combinations and record coverage, return error, elapsed simulated
-time, collisions, and success from the generated report.
+| Map | Coverage | Return error | Simulated time | Wall time | Collisions | Success |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 100.0% | 0.15 m | 342.0 s | 85.5 s | 0 | Yes |
+| 2 | 100.0% | 0.17 m | 1296.0 s | 328.9 s | 0 | Yes |
+| 3 | 100.0% | 0.18 m | 108.0 s | 27.3 s | 0 | Yes |
+| 4 | 98.1% | 0.23 m | 162.0 s | 40.9 s | 0 | Yes |
+| 5 | 99.1% | 0.17 m | 969.0 s | 245.5 s | 0 | Yes |
+
+All reported runs achieved at least 98.1% coverage, returned within the 0.30 m
+tolerance, and had no collisions.
 
 ### What I'd Do With More Time
 
 - Compare the ray-cast estimate with achieved coverage across fixed seeds and
-  tune the ray range, candidate-batch limit, and score weights from results.
+  systematically tune the added heuristic parameters: ray range/count,
+  candidate-batch limit, information threshold/weight, distance penalty,
+  blacklist radius, and clearance. The current values function well in the
+  reported runs, but are not claimed to be globally optimal.
 - Use a clearance preference in the score rather than a larger hard safety
   margin, so wall-adjacent goals are discouraged without hiding narrow areas.
+- Experiment with costmap inflation radius and cost scaling to keep the real
+  robot footprint while steering routes farther from obstacles.
+- In a full project, tune the relevant Nav2 controller and goal-checker
+  parameters as part of the navigation stack, rather than relying on an
+  enlarged footprint workaround.
 - Cache or incrementally update ray-cast results when the map changes only
   slightly.
 - Add integration tests covering Nav2 path requests, arrival-yaw selection,
   goal failure recovery, and return behaviour.
+- Investigate the occasional Map 2 localization jump in the provided
+  SLAM/localization stack and its effect on active map-frame navigation goals.
 
 ### Known Limitations / Where I Expect This to Break
 
-- A noisy or incomplete SLAM map can make a real doorway appear unsafe or
-  disconnected.
 - The ray-cast gain is optimistic: unknown cells may contain obstacles, and
   it is a proxy for future coverage rather than ground-truth coverage.
 - The final predicted path can change when Nav2 replans during execution, so
@@ -163,6 +190,10 @@ time, collisions, and success from the generated report.
   rotation.
 - Goal-only blacklisting can still allow a materially shifted version of the
   same frontier to be reconsidered after mapping changes.
+- On Map 2, localization can occasionally jump during a run. This can shift
+  the map-frame estimate abruptly, invalidate the active navigation path, and
+  ruin an otherwise successful run. Diagnosing that behaviour involves the
+  provided localization infrastructure rather than the frontier policy.
 
 ## Reproducibility
 
@@ -178,6 +209,17 @@ cd /challenge
 The selected time limit is forwarded to the explorer as `time_limit_s`. Use
 the same map, seed, time limit, time scale, and node parameters when comparing
 runs.
+
+The performance table above was produced with this explorer configuration:
+
+```bash
+ros2 run candidate_explorer explorer_node --ros-args \
+  -p distance_penalty_weight:=1.5 \
+  -p min_information_gain_m2:=1.0 \
+  -p visited_radius_m:=0.25 \
+  -p raycast_candidate_limit:=10 \
+  -p safety_margin_m:=0.05
+```
 
 ## Modified/Added Files or Packages
 
